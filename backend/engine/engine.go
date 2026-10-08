@@ -125,11 +125,33 @@ type sourceDef struct {
 }
 
 type processDef struct {
-	ID               string   `yaml:"id"`
-	Name             string   `yaml:"name"`
-	Command          string   `yaml:"command"`
-	Arguments        []string `yaml:"arguments"`
-	WorkingDirectory string   `yaml:"workingDirectory"`
+	ID               string        `yaml:"id"`
+	Name             string        `yaml:"name"`
+	Command          string        `yaml:"command"`
+	Arguments        []string      `yaml:"arguments"`
+	WorkingDirectory string        `yaml:"workingDirectory"`
+	When             *predicateDef `yaml:"when"`
+}
+
+// Structured YAML predicates (eq / in / exists). Exactly one form per when.
+type predicateDef struct {
+	Eq     *eqPred     `yaml:"eq"`
+	In     *inPred     `yaml:"in"`
+	Exists *existsPred `yaml:"exists"`
+}
+
+type eqPred struct {
+	Input string `yaml:"input"`
+	Value string `yaml:"value"`
+}
+
+type inPred struct {
+	Input  string   `yaml:"input"`
+	Values []string `yaml:"values"`
+}
+
+type existsPred struct {
+	Input string `yaml:"input"`
 }
 
 func New(cfg Config) *Engine {
@@ -274,7 +296,7 @@ func (e *Engine) execute(ar *activeRun, wf *workflowDef, project string, jl *jso
 		if mode == "" {
 			mode = "series"
 		}
-		env, err := resolveInputs(step, outputs)
+		inputs, env, err := resolveInputs(step, outputs)
 		if err != nil {
 			ar.setStatus(StatusFailed)
 			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
@@ -283,18 +305,18 @@ func (e *Engine) execute(ar *activeRun, wf *workflowDef, project string, jl *jso
 		_ = jl.Append(map[string]any{"type": "step_started", "stepId": step.ID, "mode": mode})
 		switch mode {
 		case "series":
-			if err := e.runSeries(ar, project, step, env, jl); err != nil {
-				if ar.isStopped() {
-					_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": ar.run.ID})
-					ar.setStatus(StatusStopped)
-					return
-				}
-				ar.setStatus(StatusFailed)
-				_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
+			err = e.runSeries(ar, project, step, env, jl)
+		case "decision":
+			err = e.runDecision(ar, project, step, inputs, env, jl)
+		default:
+			err = fmt.Errorf("unsupported mode %q", mode)
+		}
+		if err != nil {
+			if ar.isStopped() {
+				_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": ar.run.ID})
+				ar.setStatus(StatusStopped)
 				return
 			}
-		default:
-			err := fmt.Errorf("unsupported mode %q", mode)
 			ar.setStatus(StatusFailed)
 			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
 			return
@@ -396,7 +418,8 @@ func toWorkflowView(wf *workflowDef) *Workflow {
 	return out
 }
 
-func resolveInputs(step stepDef, outputs map[string]map[string]string) ([]string, error) {
+func resolveInputs(step stepDef, outputs map[string]map[string]string) (map[string]string, []string, error) {
+	inputs := map[string]string{}
 	var env []string
 	for _, in := range step.Inputs {
 		if in.Source == nil {
@@ -404,15 +427,16 @@ func resolveInputs(step stepDef, outputs map[string]map[string]string) ([]string
 		}
 		stepOut, ok := outputs[in.Source.StepID]
 		if !ok {
-			return nil, fmt.Errorf("input %q: step %q has no outputs yet", in.Name, in.Source.StepID)
+			return nil, nil, fmt.Errorf("input %q: step %q has no outputs yet", in.Name, in.Source.StepID)
 		}
 		val, ok := stepOut[in.Source.Output]
 		if !ok {
-			return nil, fmt.Errorf("input %q: output %q.%q not found", in.Name, in.Source.StepID, in.Source.Output)
+			return nil, nil, fmt.Errorf("input %q: output %q.%q not found", in.Name, in.Source.StepID, in.Source.Output)
 		}
+		inputs[in.Name] = val
 		env = append(env, fmt.Sprintf("SUBSPACE_INPUT_%s=%s", in.Name, val))
 	}
-	return env, nil
+	return inputs, env, nil
 }
 
 func (e *Engine) loadWorkflow(id string) (*workflowDef, error) {
@@ -441,6 +465,68 @@ func (e *Engine) runSeries(ar *activeRun, project string, step stepDef, env []st
 		}
 	}
 	return nil
+}
+
+func (e *Engine) runDecision(ar *activeRun, project string, step stepDef, inputs map[string]string, env []string, jl *jsonl) error {
+	var matched []processDef
+	for _, p := range step.Processes {
+		ok, err := predicateMatches(p.When, inputs)
+		if err != nil {
+			return err
+		}
+		if ok {
+			matched = append(matched, p)
+		}
+	}
+	if len(matched) == 0 {
+		return fmt.Errorf("decision step %q: zero processes matched", step.ID)
+	}
+	if len(matched) > 1 {
+		ids := make([]string, len(matched))
+		for i, p := range matched {
+			ids[i] = p.ID
+		}
+		return fmt.Errorf("decision step %q: multiple processes matched: %v", step.ID, ids)
+	}
+	return e.runProcess(ar, project, matched[0], env, jl)
+}
+
+func predicateMatches(p *predicateDef, inputs map[string]string) (bool, error) {
+	if p == nil {
+		return false, nil
+	}
+	n := 0
+	if p.Eq != nil {
+		n++
+	}
+	if p.In != nil {
+		n++
+	}
+	if p.Exists != nil {
+		n++
+	}
+	if n != 1 {
+		return false, fmt.Errorf("predicate must set exactly one of eq/in/exists")
+	}
+	switch {
+	case p.Eq != nil:
+		v, ok := inputs[p.Eq.Input]
+		return ok && v == p.Eq.Value, nil
+	case p.In != nil:
+		v, ok := inputs[p.In.Input]
+		if !ok {
+			return false, nil
+		}
+		for _, want := range p.In.Values {
+			if v == want {
+				return true, nil
+			}
+		}
+		return false, nil
+	default:
+		_, ok := inputs[p.Exists.Input]
+		return ok, nil
+	}
 }
 
 func (e *Engine) runProcess(ar *activeRun, project string, p processDef, env []string, jl *jsonl) error {
