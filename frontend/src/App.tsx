@@ -61,6 +61,17 @@ function deriveStepStatus(run: WorkflowRun | null, events: TimelineEvent[]): Rec
   return out;
 }
 
+function statusTone(status: string | undefined): string {
+  if (!status) return "idle";
+  const s = status.toLowerCase();
+  if (s === "running" || s === "started") return "running";
+  if (s === "succeeded" || s === "success") return "succeeded";
+  if (s === "failed" || s === "error") return "failed";
+  if (s === "stopped") return "stopped";
+  if (s === "paused") return "paused";
+  return "idle";
+}
+
 export default function App() {
   const [workflowId, setWorkflowId] = useState("pipe");
   const [projectPath, setProjectPath] = useState("");
@@ -235,112 +246,172 @@ export default function App() {
     }
   }
 
+  const tone = statusTone(run?.status);
+
   return (
-    <main style={{ fontFamily: "system-ui", maxWidth: 960, margin: "1.5rem auto", padding: "0 1rem" }}>
-      <h1>Subspace</h1>
-      <p style={{ color: "#555", marginTop: -8 }}>Canvas debugger (phase 1 — definition YAML is read-only)</p>
+    <div className="debugger">
+      <header className="debugger-header">
+        <div className="debugger-header-inner">
+          <h1 className="debugger-brand">Subspace</h1>
+          <div className="debugger-meta">
+            <span className="debugger-status" data-tone={tone}>
+              {run?.status ?? (workflow ? "ready" : "idle")}
+            </span>
+            {run && <span className="debugger-run-id">{run.id}</span>}
+            <label className="header-field">
+              Workflow
+              <input value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} />
+            </label>
+          </div>
+          <div className="toolbar" role="toolbar" aria-label="WorkflowRun controls">
+            <button className="btn-accent" disabled={busy} onClick={() => loadWorkflow()}>
+              Load
+            </button>
+            <button className="btn-start" disabled={busy} onClick={start}>
+              Start
+            </button>
+            <button className="btn-pause" disabled={busy || !run} onClick={() => control("pause")}>
+              Pause
+            </button>
+            <button className="btn-start" disabled={busy || !run} onClick={() => control("resume")}>
+              Resume
+            </button>
+            <button className="btn-stop" disabled={busy || !run} onClick={() => control("stop")}>
+              Stop
+            </button>
+            <button
+              className="btn-rewind"
+              disabled={busy || !run || !rewindStepId.trim()}
+              onClick={rewind}
+            >
+              Rewind
+            </button>
+            <button disabled={busy || !run} onClick={refresh}>
+              Refresh
+            </button>
+            <button disabled={!run} onClick={reconnect}>
+              Reconnect
+            </button>
+            <button disabled={busy} onClick={loadHistory}>
+              History
+            </button>
+          </div>
+        </div>
+      </header>
 
-      {workflow && (
-        <section style={{ marginTop: 12 }}>
-          <h2 style={{ fontSize: "1rem", marginBottom: 8 }}>
-            Canvas · {workflow.id}
-            {run ? ` · run ${run.id} (${run.status})` : ""}
-          </h2>
-          <Canvas
-            steps={workflow.steps}
-            connections={workflow.connections}
-            stepStatus={stepStatus}
-            cursorStepId={run?.cursorStepId}
-            onSelectStep={setRewindStepId}
-          />
-        </section>
-      )}
+      <div className="debugger-body">
+        {error && <p className="debugger-error">{error}</p>}
 
-      <label>
-        Workflow ID
-        <input value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} style={{ display: "block", width: "100%" }} />
-      </label>
-      <label style={{ display: "block", marginTop: 8 }}>
-        Project path (override; empty uses Workflow default)
-        <input value={projectPath} onChange={(e) => setProjectPath(e.target.value)} style={{ display: "block", width: "100%" }} />
-      </label>
-      <label style={{ display: "block", marginTop: 8 }}>
-        Input overrides (step.input=value per line)
-        <textarea value={inputOverrideText} onChange={(e) => setInputOverrideText(e.target.value)} rows={3} style={{ display: "block", width: "100%" }} />
-      </label>
-      <label style={{ display: "block", marginTop: 8 }}>
-        Argument overrides (processId=arg1,arg2 per line)
-        <textarea value={argOverrideText} onChange={(e) => setArgOverrideText(e.target.value)} rows={3} style={{ display: "block", width: "100%" }} />
-      </label>
-      <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
-        <button disabled={busy} onClick={() => loadWorkflow()}>
-          Load canvas
-        </button>
-        <button disabled={busy} onClick={start}>
-          Start
-        </button>
-        <button disabled={busy || !run} onClick={refresh}>
-          Refresh status
-        </button>
-        <button disabled={busy || !run} onClick={() => control("pause")}>
-          Pause
-        </button>
-        <button disabled={busy || !run} onClick={() => control("resume")}>
-          Resume
-        </button>
-        <button disabled={busy || !run} onClick={() => control("stop")}>
-          Stop
-        </button>
-        <button disabled={!run} onClick={reconnect}>
-          Reconnect timeline
-        </button>
-        <button disabled={busy} onClick={loadHistory}>
-          List runs
-        </button>
-      </div>
-      {history.length > 0 && (
-        <section style={{ marginTop: 12 }}>
-          <h2 style={{ fontSize: "1rem" }}>Run history</h2>
-          <ul style={{ listStyle: "none", padding: 0, margin: 0, fontFamily: "ui-monospace, monospace", fontSize: 13 }}>
-            {history.map((h) => (
-              <li key={h.id} style={{ borderBottom: "1px solid #ddd", padding: "4px 0", display: "flex", gap: 8, alignItems: "center" }}>
-                <button disabled={busy} onClick={() => reopen(h)} style={{ fontSize: 12 }}>
-                  Open
-                </button>
-                <span>
-                  {h.id} · {h.workflowId} · {h.status}
+        <div className="debugger-split">
+          <div className="debugger-canvas">
+            {workflow ? (
+              <div className="wf-canvas">
+                <Canvas
+                  steps={workflow.steps}
+                  connections={workflow.connections}
+                  stepStatus={stepStatus}
+                  cursorStepId={run?.cursorStepId}
+                  onSelectStep={setRewindStepId}
+                />
+              </div>
+            ) : (
+              <div className="canvas-empty">
+                Load a Workflow to show the canvas. Definition YAML stays read-only.
+              </div>
+            )}
+          </div>
+
+          <aside className="debugger-panel">
+            <section className="panel-section">
+              <h2>Overrides</h2>
+              <label className="field">
+                Project path
+                <input
+                  value={projectPath}
+                  onChange={(e) => setProjectPath(e.target.value)}
+                  placeholder="empty → Workflow default"
+                />
+              </label>
+              <label className="field">
+                Input overrides
+                <textarea
+                  value={inputOverrideText}
+                  onChange={(e) => setInputOverrideText(e.target.value)}
+                  rows={3}
+                  placeholder="step.input=value per line"
+                />
+              </label>
+              <label className="field">
+                Argument overrides
+                <textarea
+                  value={argOverrideText}
+                  onChange={(e) => setArgOverrideText(e.target.value)}
+                  rows={3}
+                  placeholder="processId=arg1,arg2 per line"
+                />
+              </label>
+            </section>
+
+            <section className="panel-section">
+              <h2>Rewind</h2>
+              <label className="field">
+                Step ID (click a canvas Step)
+                <span className="inline-row">
+                  <input value={rewindStepId} onChange={(e) => setRewindStepId(e.target.value)} />
+                  <button
+                    className="panel-btn danger"
+                    disabled={busy || !run || !rewindStepId.trim()}
+                    onClick={rewind}
+                  >
+                    Rewind
+                  </button>
                 </span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-      <label style={{ display: "block", marginTop: 8 }}>
-        Rewind to Step ID (click a canvas Step to fill)
-        <span style={{ display: "flex", gap: 8, marginTop: 4 }}>
-          <input value={rewindStepId} onChange={(e) => setRewindStepId(e.target.value)} style={{ flex: 1 }} />
-          <button disabled={busy || !run || !rewindStepId.trim()} onClick={rewind}>
-            Rewind
-          </button>
-        </span>
-      </label>
-      {error && <p style={{ color: "crimson" }}>{error}</p>}
-      {events.length > 0 && (
-        <section style={{ marginTop: 16 }}>
-          <h2 style={{ fontSize: "1rem" }}>Timeline</h2>
-          <ol style={{ listStyle: "none", padding: 0, margin: 0, fontFamily: "ui-monospace, monospace", fontSize: 13, maxHeight: 240, overflow: "auto" }}>
-            {events.map((ev, i) => (
-              <li key={i} style={{ borderBottom: "1px solid #ddd", padding: "4px 0" }}>
-                <span style={{ color: "#666" }}>{ev.type}</span>
-                {ev.stepId != null && <span> {ev.stepId}</span>}
-                {typeof ev.iteration === "number" && ev.iteration > 0 && <span> iter={String(ev.iteration)}</span>}
-                {ev.data != null && <span> {ev.data}</span>}
-                {ev.processId != null && ev.data == null && <span> {ev.processId}</span>}
-              </li>
-            ))}
-          </ol>
-        </section>
-      )}
-    </main>
+              </label>
+            </section>
+
+            <section className="panel-section">
+              <h2>Run history</h2>
+              {history.length === 0 ? (
+                <p className="muted">No runs listed yet. Use History in the toolbar.</p>
+              ) : (
+                <ul className="history-list">
+                  {history.map((h) => (
+                    <li key={h.id}>
+                      <button className="panel-btn" disabled={busy} onClick={() => reopen(h)}>
+                        Open
+                      </button>
+                      <span>
+                        {h.id} · {h.workflowId} · {h.status}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+
+            <section className="panel-section">
+              <h2>Timeline</h2>
+              {events.length === 0 ? (
+                <p className="muted">Timeline events appear when a WorkflowRun is live.</p>
+              ) : (
+                <ol className="timeline-list">
+                  {events.map((ev, i) => (
+                    <li key={i}>
+                      <span className="timeline-type">{ev.type}</span>
+                      {ev.stepId != null && <span> {ev.stepId}</span>}
+                      {typeof ev.iteration === "number" && ev.iteration > 0 && (
+                        <span> iter={String(ev.iteration)}</span>
+                      )}
+                      {ev.data != null && <span> {ev.data}</span>}
+                      {ev.processId != null && ev.data == null && <span> {ev.processId}</span>}
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </section>
+          </aside>
+        </div>
+      </div>
+    </div>
   );
 }

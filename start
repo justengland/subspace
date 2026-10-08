@@ -4,6 +4,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+# Optional worktree override (gitignored). Sets SUBSPACE_* / VITE_API_URL before defaults.
+[ -f "$ROOT/start.local" ] && . "$ROOT/start.local"
 FRONT_PORT="${SUBSPACE_FRONT_PORT:-4200}"
 ADDR="${SUBSPACE_ADDR:-:4201}"
 API_URL="${VITE_API_URL:-http://localhost:${ADDR#:}}"
