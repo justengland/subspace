@@ -1,0 +1,39 @@
+id: loop
+name: Loop Bounce
+steps:
+  - id: before
+    name: Before
+    mode: series
+    outputs:
+      - name: cont
+        value: no
+    processes:
+      - id: run-a
+        name: Run A
+        command: sh
+        arguments: ["-c", "echo before"]
+  - id: bounce
+    name: Bounce
+    mode: loop
+    inputs:
+      - name: cont
+        source:
+          stepId: before
+          output: cont
+    when:
+      eq:
+        input: cont
+        value: yes
+    processes:
+      - id: run-loop
+        name: Run Loop
+        command: sh
+        arguments: ["-c", "echo loop-body"]
+  - id: after
+    name: After
+    mode: series
+    processes:
+      - id: run-b
+        name: Run B
+        command: sh
+        arguments: ["-c", "echo after"]

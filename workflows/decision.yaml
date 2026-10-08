@@ -1,0 +1,49 @@
+id: decision
+name: Decision
+steps:
+  - id: set-kind
+    name: Set Kind
+    mode: series
+    outputs:
+      - name: kind
+        value: csv
+    processes:
+      - id: noop
+        name: Noop
+        command: true
+  - id: decide
+    name: Decision
+    mode: decision
+    visualization:
+      position:
+        x: 220
+        y: 40
+    inputs:
+      - name: kind
+        source:
+          stepId: set-kind
+          output: kind
+    processes:
+      - id: handle-csv
+        name: Handle CSV
+        when:
+          eq:
+            input: kind
+            value: csv
+        command: sh
+        arguments: ["-c", "echo csv"]
+      - id: handle-json
+        name: Handle JSON
+        when:
+          in:
+            input: kind
+            values: [json, ndjson]
+        command: sh
+        arguments: ["-c", "echo json"]
+      - id: handle-tagged
+        name: Handle Tagged
+        when:
+          exists:
+            input: tag
+        command: sh
+        arguments: ["-c", "echo tagged"]
