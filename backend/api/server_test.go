@@ -59,3 +59,49 @@ steps:
 		t.Fatalf("get=%+v", got)
 	}
 }
+
+func TestHTTPGetWorkflowConnections(t *testing.T) {
+	root := t.TempDir()
+	workflows := filepath.Join(root, "workflows")
+	_ = os.MkdirAll(workflows, 0o755)
+	_ = os.WriteFile(filepath.Join(workflows, "pipe.yaml"), []byte(`
+id: pipe
+steps:
+  - id: produce
+    outputs:
+      - name: msg
+        value: hello
+    processes:
+      - id: noop
+        command: true
+  - id: consume
+    inputs:
+      - name: msg
+        source:
+          stepId: produce
+          output: msg
+    processes:
+      - id: check
+        command: true
+`), 0o644)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: filepath.Join(root, "storage")})
+	h := (&api.Server{Eng: eng}).Handler()
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/workflows/pipe", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rr.Code, rr.Body)
+	}
+	var wf engine.Workflow
+	if err := json.Unmarshal(rr.Body.Bytes(), &wf); err != nil {
+		t.Fatal(err)
+	}
+	if len(wf.Connections) != 1 {
+		t.Fatalf("connections=%+v", wf.Connections)
+	}
+	c := wf.Connections[0]
+	if c.SourceStepID != "produce" || c.TargetStepID != "consume" || c.SourceOutput != "msg" || c.TargetInput != "msg" {
+		t.Fatalf("connection=%+v", c)
+	}
+}

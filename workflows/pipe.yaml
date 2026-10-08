@@ -1,0 +1,26 @@
+id: pipe
+name: Input Source Pipe
+steps:
+  - id: produce
+    name: Produce
+    mode: series
+    outputs:
+      - name: msg
+        value: hello-from-upstream
+    processes:
+      - id: noop
+        name: Noop
+        command: true
+  - id: consume
+    name: Consume
+    mode: series
+    inputs:
+      - name: msg
+        source:
+          stepId: produce
+          output: msg
+    processes:
+      - id: echo
+        name: Echo Input
+        command: sh
+        arguments: ["-c", "echo \"got=$SUBSPACE_INPUT_msg\""]
