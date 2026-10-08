@@ -1,0 +1,345 @@
+openapi: 3.1.0
+info:
+  title: Subspace control plane
+  version: 0.1.0
+  description: |
+    HTTP control plane for WorkflowRuns. Live timeline events use WebSocket at
+    GET /api/runs/{id}/events (see TimelineEvent); not a generated HTTP call.
+servers:
+  - url: http://localhost:8080
+paths:
+  /api/health:
+    get:
+      operationId: getHealth
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+  /api/workflows/{id}:
+    get:
+      operationId: getWorkflow
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Workflow with derived Connections
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workflow"
+        "404":
+          $ref: "#/components/responses/TextError"
+  /api/runs:
+    get:
+      operationId: listRuns
+      parameters:
+        - name: projectPath
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Absolute or relative Project path; empty lists all in-memory runs
+      responses:
+        "200":
+          description: In-memory WorkflowRuns (newest id first)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/WorkflowRun"
+        "400":
+          $ref: "#/components/responses/TextError"
+    post:
+      operationId: startRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartRequest"
+      responses:
+        "200":
+          description: Started WorkflowRun
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkflowRun"
+        "400":
+          $ref: "#/components/responses/TextError"
+  /api/runs/{id}:
+    get:
+      operationId: getRun
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: WorkflowRun
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkflowRun"
+        "404":
+          $ref: "#/components/responses/TextError"
+  /api/runs/{id}/pause:
+    post:
+      operationId: pauseRun
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Updated WorkflowRun
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkflowRun"
+        "400":
+          $ref: "#/components/responses/TextError"
+  /api/runs/{id}/resume:
+    post:
+      operationId: resumeRun
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Updated WorkflowRun
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkflowRun"
+        "400":
+          $ref: "#/components/responses/TextError"
+  /api/runs/{id}/stop:
+    post:
+      operationId: stopRun
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Updated WorkflowRun
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkflowRun"
+        "400":
+          $ref: "#/components/responses/TextError"
+  /api/runs/{id}/rewind:
+    post:
+      operationId: rewindRun
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RewindRequest"
+      responses:
+        "200":
+          description: Updated WorkflowRun
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkflowRun"
+        "400":
+          $ref: "#/components/responses/TextError"
+  /api/runs/{id}/events:
+    get:
+      operationId: followRunEvents
+      description: |
+        WebSocket upgrade. Server sends JSON TimelineEvent messages until the
+        run ends. Use a WebSocket client; not covered by the generated HTTP client.
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "101":
+          description: Switching Protocols (WebSocket)
+        "404":
+          $ref: "#/components/responses/TextError"
+
+components:
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+  responses:
+    TextError:
+      description: Plain-text error
+      content:
+        text/plain:
+          schema:
+            type: string
+  schemas:
+    StartRequest:
+      type: object
+      required: [workflowId]
+      properties:
+        workflowId:
+          type: string
+        projectPath:
+          type: string
+          description: Override Project; empty uses Workflow.defaultProject
+        inputOverrides:
+          type: object
+          additionalProperties:
+            type: string
+          description: "stepId.inputName → value"
+        argumentOverrides:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+          description: processId → args
+    RewindRequest:
+      type: object
+      required: [stepId]
+      properties:
+        stepId:
+          type: string
+    WorkflowRun:
+      type: object
+      required: [id, workflowId, projectPath, status]
+      properties:
+        id:
+          type: string
+        workflowId:
+          type: string
+        projectPath:
+          type: string
+        status:
+          type: string
+        cursorStepId:
+          type: string
+        stepRuns:
+          type: array
+          items:
+            $ref: "#/components/schemas/StepRun"
+        processRuns:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProcessRun"
+    StepRun:
+      type: object
+      required: [stepId, status]
+      properties:
+        stepId:
+          type: string
+        status:
+          type: string
+    ProcessRun:
+      type: object
+      required: [processId, status]
+      properties:
+        processId:
+          type: string
+        stepId:
+          type: string
+        status:
+          type: string
+        exitCode:
+          type: integer
+    Workflow:
+      type: object
+      required: [id, name, steps, connections]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        defaultProject:
+          type: string
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/StepView"
+        connections:
+          type: array
+          items:
+            $ref: "#/components/schemas/Connection"
+    StepView:
+      type: object
+      required: [id, name, mode]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        mode:
+          type: string
+        inputs:
+          type: array
+          items:
+            $ref: "#/components/schemas/InputView"
+        outputs:
+          type: array
+          items:
+            $ref: "#/components/schemas/OutputView"
+    InputView:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        source:
+          $ref: "#/components/schemas/SourceView"
+    OutputView:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        value:
+          type: string
+    SourceView:
+      type: object
+      required: [stepId, output]
+      properties:
+        stepId:
+          type: string
+        output:
+          type: string
+    Connection:
+      type: object
+      required: [sourceStepId, sourceOutput, targetStepId, targetInput]
+      properties:
+        sourceStepId:
+          type: string
+        sourceOutput:
+          type: string
+        targetStepId:
+          type: string
+        targetInput:
+          type: string
+    TimelineEvent:
+      type: object
+      required: [type]
+      description: JSONL / WebSocket timeline event
+      properties:
+        type:
+          type: string
+        ts:
+          type: string
+        runId:
+          type: string
+        workflowId:
+          type: string
+        processId:
+          type: string
+        stepId:
+          type: string
+        data:
+          type: string
+        stream:
+          type: string
+      additionalProperties: true

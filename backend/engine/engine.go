@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -375,6 +376,35 @@ func (e *Engine) Get(id string) (*WorkflowRun, error) {
 	cp.StepRuns = append([]StepRun(nil), rec.run.StepRuns...)
 	rec.mu.Unlock()
 	return &cp, nil
+}
+
+// List returns in-memory WorkflowRuns, newest id first.
+// Optional projectPath filters by absolute Project path.
+// ponytail: in-memory only; scan StorageRoot if history across restarts is needed.
+func (e *Engine) List(projectPath string) ([]WorkflowRun, error) {
+	var abs string
+	if projectPath != "" {
+		var err error
+		abs, err = filepath.Abs(projectPath)
+		if err != nil {
+			return nil, err
+		}
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]WorkflowRun, 0, len(e.runs))
+	for _, rec := range e.runs {
+		rec.mu.Lock()
+		if abs == "" || rec.run.ProjectPath == abs {
+			cp := *rec.run
+			cp.ProcessRuns = append([]ProcessRun(nil), rec.run.ProcessRuns...)
+			cp.StepRuns = append([]StepRun(nil), rec.run.StepRuns...)
+			out = append(out, cp)
+		}
+		rec.mu.Unlock()
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
+	return out, nil
 }
 
 func (e *Engine) Rewind(id, stepID string) error {

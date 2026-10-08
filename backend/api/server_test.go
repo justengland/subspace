@@ -274,3 +274,45 @@ steps:
 		t.Fatalf("connection=%+v", c)
 	}
 }
+
+func TestHTTPListRuns(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	_ = os.MkdirAll(project, 0o755)
+	_ = os.MkdirAll(workflows, 0o755)
+	_ = os.WriteFile(filepath.Join(project, "ok.sh"), []byte("#!/bin/sh\necho ok\n"), 0o755)
+	_ = os.WriteFile(filepath.Join(workflows, "one.yaml"), []byte(`
+id: one
+steps:
+  - id: s
+    mode: series
+    processes:
+      - id: p
+        command: ./ok.sh
+`), 0o644)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	h := (&api.Server{Eng: eng}).Handler()
+
+	body, _ := json.Marshal(map[string]string{"workflowId": "one", "projectPath": project})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/runs", bytes.NewReader(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("start %d: %s", rr.Code, rr.Body)
+	}
+
+	rr2 := httptest.NewRecorder()
+	h.ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/api/runs?projectPath="+project, nil))
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("list %d: %s", rr2.Code, rr2.Body)
+	}
+	var runs []engine.WorkflowRun
+	if err := json.Unmarshal(rr2.Body.Bytes(), &runs); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("runs=%+v", runs)
+	}
+}

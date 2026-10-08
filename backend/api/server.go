@@ -19,6 +19,7 @@ var upgrader = websocket.Upgrader{
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/runs", s.startRun)
+	mux.HandleFunc("GET /api/runs", s.listRuns)
 	mux.HandleFunc("GET /api/runs/{id}/events", s.followRun)
 	mux.HandleFunc("GET /api/runs/{id}", s.getRun)
 	mux.HandleFunc("POST /api/runs/{id}/pause", s.pauseRun)
@@ -44,6 +45,15 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, run)
+}
+
+func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
+	runs, err := s.Eng.List(r.URL.Query().Get("projectPath"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, runs)
 }
 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {

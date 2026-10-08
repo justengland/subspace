@@ -1,44 +1,5 @@
 import { useEffect, useState } from "react";
-
-const API = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
-
-type ProcessRun = {
-  processId: string;
-  status: string;
-  exitCode?: number;
-};
-
-type WorkflowRun = {
-  id: string;
-  workflowId: string;
-  projectPath: string;
-  status: string;
-  cursorStepId?: string;
-  stepRuns?: { stepId: string; status: string }[];
-  processRuns?: ProcessRun[];
-};
-
-type TimelineEvent = {
-  type: string;
-  ts?: string;
-  data?: string;
-  processId?: string;
-  [key: string]: unknown;
-};
-
-type Connection = {
-  sourceStepId: string;
-  sourceOutput: string;
-  targetStepId: string;
-  targetInput: string;
-};
-
-type Workflow = {
-  id: string;
-  name: string;
-  defaultProject?: string;
-  connections: Connection[];
-};
+import { API_BASE, api, type StartRequest, type TimelineEvent, type Workflow, type WorkflowRun } from "./api/client";
 
 /** Parse "step.input=value" lines into InputOverrides. */
 function parseInputOverrides(text: string): Record<string, string> {
@@ -69,7 +30,7 @@ function parseArgOverrides(text: string): Record<string, string[]> {
 }
 
 function wsURL(path: string) {
-  const base = API.replace(/^http/, "ws");
+  const base = API_BASE.replace(/^http/, "ws");
   return `${base}${path}`;
 }
 
@@ -106,11 +67,12 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
-      const res = await fetch(`${API}/api/workflows/${workflowId}`);
-      if (!res.ok) throw new Error(await res.text());
-      const wf: Workflow = await res.json();
-      setWorkflow(wf);
-      if (!projectPath && wf.defaultProject) setProjectPath(wf.defaultProject);
+      const { data, error: err } = await api.GET("/api/workflows/{id}", {
+        params: { path: { id: workflowId } },
+      });
+      if (err || !data) throw new Error(typeof err === "string" ? err : "getWorkflow failed");
+      setWorkflow(data);
+      if (!projectPath && data.defaultProject) setProjectPath(data.defaultProject);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -123,19 +85,15 @@ export default function App() {
     setError("");
     setEvents([]);
     try {
-      const body: Record<string, unknown> = { workflowId };
+      const body: StartRequest = { workflowId };
       if (projectPath) body.projectPath = projectPath;
       const inputs = parseInputOverrides(inputOverrideText);
       if (Object.keys(inputs).length) body.inputOverrides = inputs;
       const args = parseArgOverrides(argOverrideText);
       if (Object.keys(args).length) body.argumentOverrides = args;
-      const res = await fetch(`${API}/api/runs`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      setRun(await res.json());
+      const { data, error: err } = await api.POST("/api/runs", { body });
+      if (err || !data) throw new Error(typeof err === "string" ? err : "startRun failed");
+      setRun(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -148,9 +106,11 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
-      const res = await fetch(`${API}/api/runs/${run.id}`);
-      if (!res.ok) throw new Error(await res.text());
-      setRun(await res.json());
+      const { data, error: err } = await api.GET("/api/runs/{id}", {
+        params: { path: { id: run.id } },
+      });
+      if (err || !data) throw new Error(typeof err === "string" ? err : "getRun failed");
+      setRun(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -169,9 +129,17 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
-      const res = await fetch(`${API}/api/runs/${run.id}/${action}`, { method: "POST" });
-      if (!res.ok) throw new Error(await res.text());
-      setRun(await res.json());
+      const path =
+        action === "pause"
+          ? "/api/runs/{id}/pause"
+          : action === "resume"
+            ? "/api/runs/{id}/resume"
+            : "/api/runs/{id}/stop";
+      const { data, error: err } = await api.POST(path, {
+        params: { path: { id: run.id } },
+      });
+      if (err || !data) throw new Error(typeof err === "string" ? err : `${action} failed`);
+      setRun(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -184,13 +152,12 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
-      const res = await fetch(`${API}/api/runs/${run.id}/rewind`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stepId: rewindStepId.trim() }),
+      const { data, error: err } = await api.POST("/api/runs/{id}/rewind", {
+        params: { path: { id: run.id } },
+        body: { stepId: rewindStepId.trim() },
       });
-      if (!res.ok) throw new Error(await res.text());
-      setRun(await res.json());
+      if (err || !data) throw new Error(typeof err === "string" ? err : "rewind failed");
+      setRun(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
