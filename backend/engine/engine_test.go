@@ -124,6 +124,111 @@ steps:
 	}
 }
 
+func TestRewindDiscardsLaterStepRunsThenResumeReexecutes(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(project, "one.sh"), `#!/bin/sh
+n=0
+[ -f "$PWD/one.count" ] && n=$(cat "$PWD/one.count")
+echo $((n+1)) > "$PWD/one.count"
+touch "$PWD/one.done"
+`)
+	writeFile(t, filepath.Join(project, "two.sh"), `#!/bin/sh
+touch "$PWD/two.started"
+sleep 2
+touch "$PWD/two.done"
+`)
+	writeFile(t, filepath.Join(project, "three.sh"), `#!/bin/sh
+touch "$PWD/three.done"
+`)
+	chmodX(t, filepath.Join(project, "one.sh"))
+	chmodX(t, filepath.Join(project, "two.sh"))
+	chmodX(t, filepath.Join(project, "three.sh"))
+
+	writeFile(t, filepath.Join(workflows, "three-step.yaml"), `
+id: three-step
+steps:
+  - id: one
+    mode: series
+    processes:
+      - id: p1
+        command: ./one.sh
+  - id: two
+    mode: series
+    processes:
+      - id: p2
+        command: ./two.sh
+  - id: three
+    mode: series
+    processes:
+      - id: p3
+        command: ./three.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{WorkflowID: "three-step", ProjectPath: project})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitFile(t, filepath.Join(project, "two.started"), 3*time.Second)
+	if err := eng.Pause(run.ID); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	got := waitStatus(t, eng, run.ID, engine.StatusPaused)
+	if _, err := os.Stat(filepath.Join(project, "two.done")); err != nil {
+		t.Fatalf("expected step two finished before hold: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(project, "three.done")); err == nil {
+		t.Fatal("step three ran before Rewind")
+	}
+	if len(got.StepRuns) < 2 {
+		t.Fatalf("StepRuns before Rewind=%d want >=2: %+v", len(got.StepRuns), got.StepRuns)
+	}
+
+	if err := eng.Rewind(run.ID, "one"); err != nil {
+		t.Fatalf("Rewind: %v", err)
+	}
+	got, err = eng.Get(run.ID)
+	if err != nil {
+		t.Fatalf("Get after Rewind: %v", err)
+	}
+	if got.CursorStepID != "one" {
+		t.Fatalf("cursor=%q want one", got.CursorStepID)
+	}
+	if len(got.StepRuns) != 0 {
+		t.Fatalf("StepRuns after Rewind=%+v want discarded", got.StepRuns)
+	}
+	for _, pr := range got.ProcessRuns {
+		if pr.StepID == "one" || pr.StepID == "two" || pr.StepID == "three" {
+			t.Fatalf("ProcessRun still present after Rewind: %+v", pr)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(project, "three.done")); err == nil {
+		t.Fatal("step three ran during Rewind")
+	}
+
+	_ = os.Remove(filepath.Join(project, "one.done"))
+	_ = os.Remove(filepath.Join(project, "two.done"))
+	_ = os.Remove(filepath.Join(project, "two.started"))
+
+	if err := eng.Resume(run.ID); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	_ = waitStatus(t, eng, run.ID, engine.StatusSucceeded)
+	count := strings.TrimSpace(readFile(t, filepath.Join(project, "one.count")))
+	if count != "2" {
+		t.Fatalf("one.count=%q want 2 (re-executed after Rewind)", count)
+	}
+	if _, err := os.Stat(filepath.Join(project, "three.done")); err != nil {
+		t.Fatalf("step three did not run after Resume: %v", err)
+	}
+}
+
 func TestSeriesWorkflowSucceeds(t *testing.T) {
 	root := t.TempDir()
 	project := filepath.Join(root, "my-project")

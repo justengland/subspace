@@ -24,6 +24,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/runs/{id}/pause", s.pauseRun)
 	mux.HandleFunc("POST /api/runs/{id}/resume", s.resumeRun)
 	mux.HandleFunc("POST /api/runs/{id}/stop", s.stopRun)
+	mux.HandleFunc("POST /api/runs/{id}/rewind", s.rewindRun)
 	mux.HandleFunc("GET /api/workflows/{id}", s.getWorkflow)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -77,6 +78,25 @@ func (s *Server) resumeRun(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) stopRun(w http.ResponseWriter, r *http.Request) {
 	if err := s.Eng.Stop(r.PathValue("id")); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.writeRun(w, r.PathValue("id"))
+}
+
+func (s *Server) rewindRun(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		StepID string `json:"stepId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.StepID == "" {
+		http.Error(w, "stepId required", http.StatusBadRequest)
+		return
+	}
+	if err := s.Eng.Rewind(r.PathValue("id"), body.StepID); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

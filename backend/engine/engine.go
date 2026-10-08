@@ -45,6 +45,8 @@ type runRec struct {
 	stopped  bool
 	resumeCh chan struct{}
 	cmds     []*exec.Cmd
+	stepIDs  []string
+	rewindTo int // -1 = none; index to resume from after Pause
 }
 
 type StartRequest struct {
@@ -56,16 +58,24 @@ type StartRequest struct {
 
 type ProcessRun struct {
 	ProcessID string `json:"processId"`
+	StepID    string `json:"stepId,omitempty"`
 	Status    string `json:"status"`
 	ExitCode  int    `json:"exitCode,omitempty"`
 }
 
+type StepRun struct {
+	StepID string `json:"stepId"`
+	Status string `json:"status"`
+}
+
 type WorkflowRun struct {
-	ID          string       `json:"id"`
-	WorkflowID  string       `json:"workflowId"`
-	ProjectPath string       `json:"projectPath"`
-	Status      string       `json:"status"`
-	ProcessRuns []ProcessRun `json:"processRuns,omitempty"`
+	ID           string       `json:"id"`
+	WorkflowID   string       `json:"workflowId"`
+	ProjectPath  string       `json:"projectPath"`
+	Status       string       `json:"status"`
+	CursorStepID string       `json:"cursorStepId,omitempty"`
+	StepRuns     []StepRun    `json:"stepRuns,omitempty"`
+	ProcessRuns  []ProcessRun `json:"processRuns,omitempty"`
 }
 
 // Connection is a derived edge from Input.source (not stored in YAML).
@@ -208,7 +218,14 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 	if err != nil {
 		return nil, err
 	}
-	rec := &runRec{run: run, jl: jl, path: jsonlPath, done: make(chan struct{}), resumeCh: make(chan struct{})}
+	stepIDs := make([]string, len(wf.Steps))
+	for i, s := range wf.Steps {
+		stepIDs[i] = s.ID
+	}
+	rec := &runRec{
+		run: run, jl: jl, path: jsonlPath, done: make(chan struct{}),
+		resumeCh: make(chan struct{}), stepIDs: stepIDs, rewindTo: -1,
+	}
 	e.mu.Lock()
 	e.runs[id] = rec
 	e.mu.Unlock()
@@ -243,8 +260,17 @@ func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req Start
 			_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": run.ID})
 			return
 		}
+		if idx, ok := rec.takeRewind(); ok {
+			i = idx
+			for j := idx; j < len(wf.Steps); j++ {
+				delete(outputs, wf.Steps[j].ID)
+				delete(loopIters, wf.Steps[j].ID)
+			}
+			continue
+		}
 
 		step := wf.Steps[i]
+		rec.setCursor(step.ID)
 		mode := step.Mode
 		if mode == "" {
 			mode = "series"
@@ -312,12 +338,23 @@ func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req Start
 		}
 		outputs[step.ID] = stepOut
 		_ = jl.Append(map[string]any{"type": "step_succeeded", "stepId": step.ID})
+		rec.appendStepRun(StepRun{StepID: step.ID, Status: StatusSucceeded})
 		i += delta
+		if i < len(wf.Steps) {
+			rec.setCursor(wf.Steps[i].ID)
+		}
 
 		if err := rec.waitIfPaused(); err != nil {
 			rec.setStatus(StatusStopped)
 			_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": run.ID})
 			return
+		}
+		if idx, ok := rec.takeRewind(); ok {
+			i = idx
+			for j := idx; j < len(wf.Steps); j++ {
+				delete(outputs, wf.Steps[j].ID)
+				delete(loopIters, wf.Steps[j].ID)
+			}
 		}
 	}
 
@@ -335,8 +372,58 @@ func (e *Engine) Get(id string) (*WorkflowRun, error) {
 	rec.mu.Lock()
 	cp := *rec.run
 	cp.ProcessRuns = append([]ProcessRun(nil), rec.run.ProcessRuns...)
+	cp.StepRuns = append([]StepRun(nil), rec.run.StepRuns...)
 	rec.mu.Unlock()
 	return &cp, nil
+}
+
+func (e *Engine) Rewind(id, stepID string) error {
+	rec, err := e.getRec(id)
+	if err != nil {
+		return err
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.run.Status != StatusPaused {
+		return fmt.Errorf("WorkflowRun %q is not paused", id)
+	}
+	idx := -1
+	for i, s := range rec.stepIDs {
+		if s == stepID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return fmt.Errorf("step %q not in workflow", stepID)
+	}
+	var keepSteps []StepRun
+	for _, sr := range rec.run.StepRuns {
+		if stepIndex(rec.stepIDs, sr.StepID) < idx {
+			keepSteps = append(keepSteps, sr)
+		}
+	}
+	rec.run.StepRuns = keepSteps
+	var keepPR []ProcessRun
+	for _, pr := range rec.run.ProcessRuns {
+		if stepIndex(rec.stepIDs, pr.StepID) < idx {
+			keepPR = append(keepPR, pr)
+		}
+	}
+	rec.run.ProcessRuns = keepPR
+	rec.run.CursorStepID = stepID
+	rec.rewindTo = idx
+	_ = rec.jl.Append(map[string]any{"type": "workflow_rewound", "runId": id, "stepId": stepID})
+	return nil
+}
+
+func stepIndex(ids []string, id string) int {
+	for i, s := range ids {
+		if s == id {
+			return i
+		}
+	}
+	return -1
 }
 
 func (e *Engine) Pause(id string) error {
@@ -408,6 +495,29 @@ func (rec *runRec) setStatus(status string) {
 	rec.mu.Lock()
 	rec.run.Status = status
 	rec.mu.Unlock()
+}
+
+func (rec *runRec) setCursor(stepID string) {
+	rec.mu.Lock()
+	rec.run.CursorStepID = stepID
+	rec.mu.Unlock()
+}
+
+func (rec *runRec) appendStepRun(sr StepRun) {
+	rec.mu.Lock()
+	rec.run.StepRuns = append(rec.run.StepRuns, sr)
+	rec.mu.Unlock()
+}
+
+func (rec *runRec) takeRewind() (int, bool) {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.rewindTo < 0 {
+		return 0, false
+	}
+	idx := rec.rewindTo
+	rec.rewindTo = -1
+	return idx, true
 }
 
 func (rec *runRec) isStopped() bool {
@@ -611,6 +721,7 @@ func (e *Engine) runSeries(rec *runRec, project string, step stepDef, env []stri
 			return fmt.Errorf("stopped")
 		}
 		pr, err := e.runProcess(rec, project, p, env, argOverrides, jl, nil)
+		pr.StepID = step.ID
 		rec.appendProcessRun(pr)
 		if err != nil {
 			return err
@@ -685,6 +796,7 @@ func (e *Engine) runParallel(rec *runRec, project string, step stepDef, env []st
 	wg.Wait()
 
 	for _, s := range slots {
+		s.pr.StepID = step.ID
 		rec.appendProcessRun(s.pr)
 	}
 	return firstErr
@@ -712,6 +824,7 @@ func (e *Engine) runDecision(rec *runRec, project string, step stepDef, inputs m
 		return fmt.Errorf("decision step %q: multiple processes matched: %v", step.ID, ids)
 	}
 	pr, err := e.runProcess(rec, project, matched[0], env, argOverrides, jl, nil)
+	pr.StepID = step.ID
 	rec.appendProcessRun(pr)
 	return err
 }

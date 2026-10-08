@@ -13,6 +13,8 @@ type WorkflowRun = {
   workflowId: string;
   projectPath: string;
   status: string;
+  cursorStepId?: string;
+  stepRuns?: { stepId: string; status: string }[];
   processRuns?: ProcessRun[];
 };
 
@@ -80,6 +82,7 @@ export default function App() {
   const [workflow, setWorkflow] = useState<Workflow | null>(null);
   const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [timelineKey, setTimelineKey] = useState(0);
+  const [rewindStepId, setRewindStepId] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -176,6 +179,25 @@ export default function App() {
     }
   }
 
+  async function rewind() {
+    if (!run || !rewindStepId.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      const res = await fetch(`${API}/api/runs/${run.id}/rewind`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ stepId: rewindStepId.trim() }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setRun(await res.json());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <main style={{ fontFamily: "system-ui", maxWidth: 640, margin: "2rem auto" }}>
       <h1>Subspace</h1>
@@ -218,6 +240,15 @@ export default function App() {
           Reconnect timeline
         </button>
       </div>
+      <label style={{ display: "block", marginTop: 8 }}>
+        Rewind to Step ID
+        <span style={{ display: "flex", gap: 8, marginTop: 4 }}>
+          <input value={rewindStepId} onChange={(e) => setRewindStepId(e.target.value)} style={{ flex: 1 }} />
+          <button disabled={busy || !run || !rewindStepId.trim()} onClick={rewind}>
+            Rewind
+          </button>
+        </span>
+      </label>
       {error && <p style={{ color: "crimson" }}>{error}</p>}
       {workflow && (
         <section style={{ marginTop: 16 }}>
