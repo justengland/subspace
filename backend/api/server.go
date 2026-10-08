@@ -2,14 +2,17 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/gorilla/websocket"
 	"github.com/justengland/subspace/backend/engine"
+	"github.com/justengland/subspace/backend/registry"
 )
 
 type Server struct {
-	Eng *engine.Engine
+	Eng  *engine.Engine
+	Home string // Subspace home; repos.json lives here
 }
 
 var upgrader = websocket.Upgrader{
@@ -18,28 +21,58 @@ var upgrader = websocket.Upgrader{
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/runs", s.startRun)
-	mux.HandleFunc("GET /api/runs", s.listRuns)
-	mux.HandleFunc("GET /api/runs/{id}/events", s.followRun)
-	mux.HandleFunc("GET /api/runs/{id}", s.getRun)
-	mux.HandleFunc("POST /api/runs/{id}/pause", s.pauseRun)
-	mux.HandleFunc("POST /api/runs/{id}/resume", s.resumeRun)
-	mux.HandleFunc("POST /api/runs/{id}/stop", s.stopRun)
-	mux.HandleFunc("POST /api/runs/{id}/rewind", s.rewindRun)
-	mux.HandleFunc("GET /api/workflows/{id}", s.getWorkflow)
+	mux.HandleFunc("POST /api/runs/{repo}", s.startRun)
+	mux.HandleFunc("GET /api/runs/{repo}", s.listRuns)
+	mux.HandleFunc("GET /api/runs/{repo}/{runId}/events", s.followRun)
+	mux.HandleFunc("POST /api/runs/{repo}/{runId}/pause", s.pauseRun)
+	mux.HandleFunc("POST /api/runs/{repo}/{runId}/resume", s.resumeRun)
+	mux.HandleFunc("POST /api/runs/{repo}/{runId}/stop", s.stopRun)
+	mux.HandleFunc("POST /api/runs/{repo}/{runId}/rewind", s.rewindRun)
+	mux.HandleFunc("GET /api/runs/{repo}/{runId}", s.getRun)
+	mux.HandleFunc("GET /api/workflows/{repo}/{workflowId}", s.getWorkflow)
+	mux.HandleFunc("GET /api/workflows/{repo}", s.listWorkflows)
+	mux.HandleFunc("GET /api/repos", s.listRepos)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	return withCORS(mux)
 }
 
+func (s *Server) listRepos(w http.ResponseWriter, _ *http.Request) {
+	repos, err := registry.List(s.Home)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, repos)
+}
+
 func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
+	repo := r.PathValue("repo")
+	if repo == "" {
+		http.Error(w, "missing repo", http.StatusBadRequest)
+		return
+	}
+	repoPath, err := registry.AbsolutePath(s.Home, repo)
+	if err != nil {
+		var nf *registry.NotFoundError
+		if errors.As(err, &nf) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	var req engine.StartRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	run, err := s.Eng.Start(req)
+	if req.WorkflowID == "" {
+		http.Error(w, "workflowId required", http.StatusBadRequest)
+		return
+	}
+	run, err := s.Eng.StartInRepo(repo, repoPath, req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -48,21 +81,33 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
-	runs, err := s.Eng.List(r.URL.Query().Get("projectPath"))
+	repo := r.PathValue("repo")
+	if repo == "" {
+		http.Error(w, "missing repo", http.StatusBadRequest)
+		return
+	}
+	if !s.requireRepo(w, repo) {
+		return
+	}
+	runs, err := s.Eng.ListInRepo(repo)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusOK, runs)
 }
 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
+	repo := r.PathValue("repo")
+	id := r.PathValue("runId")
+	if repo == "" || id == "" {
+		http.Error(w, "missing repo or runId", http.StatusBadRequest)
 		return
 	}
-	run, err := s.Eng.Get(id)
+	if !s.requireRepo(w, repo) {
+		return
+	}
+	run, err := s.Eng.GetInRepo(repo, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -71,30 +116,46 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) pauseRun(w http.ResponseWriter, r *http.Request) {
-	if err := s.Eng.Pause(r.PathValue("id")); err != nil {
+	repo, id, ok := s.runPath(w, r)
+	if !ok {
+		return
+	}
+	if err := s.Eng.PauseInRepo(repo, id); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.writeRun(w, r.PathValue("id"))
+	s.writeRunInRepo(w, repo, id)
 }
 
 func (s *Server) resumeRun(w http.ResponseWriter, r *http.Request) {
-	if err := s.Eng.Resume(r.PathValue("id")); err != nil {
+	repo, id, ok := s.runPath(w, r)
+	if !ok {
+		return
+	}
+	if err := s.Eng.ResumeInRepo(repo, id); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.writeRun(w, r.PathValue("id"))
+	s.writeRunInRepo(w, repo, id)
 }
 
 func (s *Server) stopRun(w http.ResponseWriter, r *http.Request) {
-	if err := s.Eng.Stop(r.PathValue("id")); err != nil {
+	repo, id, ok := s.runPath(w, r)
+	if !ok {
+		return
+	}
+	if err := s.Eng.StopInRepo(repo, id); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.writeRun(w, r.PathValue("id"))
+	s.writeRunInRepo(w, repo, id)
 }
 
 func (s *Server) rewindRun(w http.ResponseWriter, r *http.Request) {
+	repo, id, ok := s.runPath(w, r)
+	if !ok {
+		return
+	}
 	var body struct {
 		StepID string `json:"stepId"`
 	}
@@ -106,15 +167,32 @@ func (s *Server) rewindRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "stepId required", http.StatusBadRequest)
 		return
 	}
-	if err := s.Eng.Rewind(r.PathValue("id"), body.StepID); err != nil {
+	if err := s.Eng.RewindInRepo(repo, id, body.StepID); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.writeRun(w, r.PathValue("id"))
+	s.writeRunInRepo(w, repo, id)
 }
 
-func (s *Server) writeRun(w http.ResponseWriter, id string) {
-	run, err := s.Eng.Get(id)
+func (s *Server) runPath(w http.ResponseWriter, r *http.Request) (repo, id string, ok bool) {
+	repo = r.PathValue("repo")
+	id = r.PathValue("runId")
+	if repo == "" || id == "" {
+		http.Error(w, "missing repo or runId", http.StatusBadRequest)
+		return "", "", false
+	}
+	if !s.requireRepo(w, repo) {
+		return "", "", false
+	}
+	if _, err := s.Eng.GetInRepo(repo, id); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return "", "", false
+	}
+	return repo, id, true
+}
+
+func (s *Server) writeRunInRepo(w http.ResponseWriter, repo, id string) {
+	run, err := s.Eng.GetInRepo(repo, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -122,13 +200,47 @@ func (s *Server) writeRun(w http.ResponseWriter, id string) {
 	writeJSON(w, http.StatusOK, run)
 }
 
-func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
+func (s *Server) requireRepo(w http.ResponseWriter, name string) bool {
+	ok, err := registry.Has(s.Home, name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return false
+	}
+	if !ok {
+		http.Error(w, "unknown repo: "+name, http.StatusNotFound)
+		return false
+	}
+	return true
+}
+
+func (s *Server) listWorkflows(w http.ResponseWriter, r *http.Request) {
+	repo := r.PathValue("repo")
+	if repo == "" {
+		http.Error(w, "missing repo", http.StatusBadRequest)
 		return
 	}
-	wf, err := s.Eng.GetWorkflow(id)
+	if !s.requireRepo(w, repo) {
+		return
+	}
+	list, err := s.Eng.ListWorkflows(repo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
+	repo := r.PathValue("repo")
+	id := r.PathValue("workflowId")
+	if repo == "" || id == "" {
+		http.Error(w, "missing repo or workflowId", http.StatusBadRequest)
+		return
+	}
+	if !s.requireRepo(w, repo) {
+		return
+	}
+	wf, err := s.Eng.GetWorkflowInRepo(repo, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -137,8 +249,11 @@ func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) followRun(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	ch, cancel, err := s.Eng.Follow(id)
+	repo, id, ok := s.runPath(w, r)
+	if !ok {
+		return
+	}
+	ch, cancel, err := s.Eng.FollowInRepo(repo, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return

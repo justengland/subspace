@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -25,6 +26,7 @@ const (
 )
 
 type Config struct {
+	// WorkflowsDir is legacy Start/GetWorkflow only (engine tests). Runtime uses StorageRoot/<repo>/workflows.
 	WorkflowsDir string
 	StorageRoot  string
 }
@@ -37,6 +39,7 @@ type Engine struct {
 
 type runRec struct {
 	run  *WorkflowRun
+	repo string // empty for legacy Start (WorkflowsDir); set for StartInRepo
 	jl   *jsonl
 	path string
 	done chan struct{}
@@ -48,6 +51,14 @@ type runRec struct {
 	cmds     []*exec.Cmd
 	stepIDs  []string
 	rewindTo int // -1 = none; index to resume from after Pause
+}
+
+// runKey namespaces live runs so two Repos can share a short timestamp id.
+func runKey(repo, id string) string {
+	if repo == "" {
+		return id
+	}
+	return repo + "/" + id
 }
 
 type StartRequest struct {
@@ -214,25 +225,48 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 	if err != nil {
 		return nil, err
 	}
-	projectPath := req.ProjectPath
-	if projectPath == "" {
-		projectPath = wf.DefaultProject
+	workingTree := req.ProjectPath
+	if workingTree == "" {
+		workingTree = wf.DefaultProject
 	}
-	if projectPath == "" {
-		return nil, fmt.Errorf("project path required (no Workflow defaultProject)")
+	if workingTree == "" {
+		return nil, fmt.Errorf("working tree required (no Workflow defaultProject)")
 	}
-	project, err := filepath.Abs(projectPath)
+	repoPath, err := filepath.Abs(workingTree)
 	if err != nil {
 		return nil, err
 	}
+	return e.beginRun("", wf, repoPath, req)
+}
+
+// StartInRepo starts a Workflow from StorageRoot/<repo>/workflows and stores
+// artifacts under StorageRoot/<repo>/<run-id>/. repoPath is the Repo absolute path.
+func (e *Engine) StartInRepo(repo, repoPath string, req StartRequest) (*WorkflowRun, error) {
+	wf, err := e.loadWorkflowInRepo(repo, req.WorkflowID)
+	if err != nil {
+		return nil, err
+	}
+	repoPath, err = filepath.Abs(repoPath)
+	if err != nil {
+		return nil, err
+	}
+	return e.beginRun(repo, wf, repoPath, req)
+}
+
+func (e *Engine) beginRun(repo string, wf *workflowDef, repoPath string, req StartRequest) (*WorkflowRun, error) {
 	id := shortID()
 	run := &WorkflowRun{
 		ID:          id,
 		WorkflowID:  wf.ID,
-		ProjectPath: project,
+		ProjectPath: repoPath,
 		Status:      StatusRunning,
 	}
-	runDir := filepath.Join(e.cfg.StorageRoot, filepath.Base(project), id)
+	var runDir string
+	if repo != "" {
+		runDir = filepath.Join(e.cfg.StorageRoot, repo, id)
+	} else {
+		runDir = filepath.Join(e.cfg.StorageRoot, filepath.Base(repoPath), id)
+	}
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -246,20 +280,20 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 		stepIDs[i] = s.ID
 	}
 	rec := &runRec{
-		run: run, jl: jl, path: jsonlPath, done: make(chan struct{}),
+		run: run, repo: repo, jl: jl, path: jsonlPath, done: make(chan struct{}),
 		resumeCh: make(chan struct{}), stepIDs: stepIDs, rewindTo: -1,
 	}
 	e.mu.Lock()
-	e.runs[id] = rec
+	e.runs[runKey(repo, id)] = rec
 	e.mu.Unlock()
 
-	go e.execute(rec, wf, project, req)
+	go e.execute(rec, wf, repoPath, req)
 
 	cp := *run
 	return &cp, nil
 }
 
-func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req StartRequest) {
+func (e *Engine) execute(rec *runRec, wf *workflowDef, repoPath string, req StartRequest) {
 	defer func() {
 		_ = rec.jl.Close()
 		close(rec.done)
@@ -267,7 +301,7 @@ func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req Start
 	jl := rec.jl
 	run := rec.run
 
-	_ = jl.Append(map[string]any{"type": "workflow_started", "workflowId": wf.ID, "runId": run.ID, "projectPath": project})
+	_ = jl.Append(map[string]any{"type": "workflow_started", "workflowId": wf.ID, "runId": run.ID, "projectPath": repoPath})
 
 	outputs := map[string]map[string]string{}
 	loopIters := map[string]int{}
@@ -331,16 +365,16 @@ func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req Start
 		var stepErr error
 		switch mode {
 		case "series":
-			stepErr = e.runSeries(rec, project, step, env, req.ArgumentOverrides, jl)
+			stepErr = e.runSeries(rec, repoPath, step, env, req.ArgumentOverrides, jl)
 			delta = 1
 		case "parallel":
-			stepErr = e.runParallel(rec, project, step, env, req.ArgumentOverrides, jl)
+			stepErr = e.runParallel(rec, repoPath, step, env, req.ArgumentOverrides, jl)
 			delta = 1
 		case "decision":
-			stepErr = e.runDecision(rec, project, step, inputs, env, req.ArgumentOverrides, jl)
+			stepErr = e.runDecision(rec, repoPath, step, inputs, env, req.ArgumentOverrides, jl)
 			delta = 1
 		case "loop":
-			delta, stepErr = e.runLoop(rec, project, step, inputs, env, req.ArgumentOverrides, jl, i)
+			delta, stepErr = e.runLoop(rec, repoPath, step, inputs, env, req.ArgumentOverrides, jl, i)
 		default:
 			stepErr = fmt.Errorf("unsupported mode %q", mode)
 		}
@@ -403,6 +437,31 @@ func (e *Engine) Get(id string) (*WorkflowRun, error) {
 	return run, err
 }
 
+// GetInRepo returns a WorkflowRun under StorageRoot/<repo>/<id>/.
+func (e *Engine) GetInRepo(repo, id string) (*WorkflowRun, error) {
+	e.mu.Lock()
+	rec, ok := e.runs[runKey(repo, id)]
+	e.mu.Unlock()
+	if ok {
+		rec.mu.Lock()
+		cp := *rec.run
+		cp.ProcessRuns = append([]ProcessRun(nil), rec.run.ProcessRuns...)
+		cp.StepRuns = append([]StepRun(nil), rec.run.StepRuns...)
+		rec.mu.Unlock()
+		return &cp, nil
+	}
+	path := filepath.Join(e.cfg.StorageRoot, repo, id, "events.jsonl")
+	events, err := readJSONLFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("WorkflowRun %q not found in repo %q", id, repo)
+	}
+	run := reconstructRun(events)
+	if run.ID == "" {
+		run.ID = id
+	}
+	return run, nil
+}
+
 // List returns WorkflowRuns from memory and StorageRoot, newest id first.
 // Optional projectPath filters by absolute Project path.
 func (e *Engine) List(projectPath string) ([]WorkflowRun, error) {
@@ -440,8 +499,146 @@ func (e *Engine) List(projectPath string) ([]WorkflowRun, error) {
 	return out, nil
 }
 
-func (e *Engine) Rewind(id, stepID string) error {
-	rec, err := e.getRec(id)
+// ListInRepo returns WorkflowRuns for one Repo (memory + StorageRoot/<repo>/), newest first.
+func (e *Engine) ListInRepo(repo string) ([]WorkflowRun, error) {
+	seen := map[string]struct{}{}
+	var out []WorkflowRun
+
+	e.mu.Lock()
+	for _, rec := range e.runs {
+		if rec.repo != repo {
+			continue
+		}
+		rec.mu.Lock()
+		cp := *rec.run
+		cp.ProcessRuns = append([]ProcessRun(nil), rec.run.ProcessRuns...)
+		cp.StepRuns = append([]StepRun(nil), rec.run.StepRuns...)
+		out = append(out, cp)
+		seen[cp.ID] = struct{}{}
+		rec.mu.Unlock()
+	}
+	e.mu.Unlock()
+
+	dir := filepath.Join(e.cfg.StorageRoot, repo)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
+			return out, nil
+		}
+		return nil, err
+	}
+	for _, ent := range entries {
+		if !ent.IsDir() || ent.Name() == "workflows" {
+			continue
+		}
+		id := ent.Name()
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		path := filepath.Join(dir, id, "events.jsonl")
+		events, err := readJSONLFile(path)
+		if err != nil || len(events) == 0 {
+			continue
+		}
+		run := reconstructRun(events)
+		if run.ID == "" {
+			run.ID = id
+		}
+		out = append(out, *run)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
+	return out, nil
+}
+
+func stepIndex(ids []string, id string) int {
+	for i, s := range ids {
+		if s == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func (e *Engine) getRec(id string) (*runRec, error) {
+	return e.getRecInRepo("", id)
+}
+
+func (e *Engine) getRecInRepo(repo, id string) (*runRec, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	rec, ok := e.runs[runKey(repo, id)]
+	if !ok {
+		return nil, fmt.Errorf("WorkflowRun %q not found", id)
+	}
+	return rec, nil
+}
+
+func (e *Engine) Pause(id string) error { return e.PauseInRepo("", id) }
+
+func (e *Engine) PauseInRepo(repo, id string) error {
+	rec, err := e.getRecInRepo(repo, id)
+	if err != nil {
+		return err
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.stopped {
+		return fmt.Errorf("WorkflowRun %q is stopped", id)
+	}
+	rec.pauseReq = true
+	return nil
+}
+
+func (e *Engine) Resume(id string) error { return e.ResumeInRepo("", id) }
+
+func (e *Engine) ResumeInRepo(repo, id string) error {
+	rec, err := e.getRecInRepo(repo, id)
+	if err != nil {
+		return err
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.run.Status != StatusPaused {
+		return fmt.Errorf("WorkflowRun %q is not paused", id)
+	}
+	rec.pauseReq = false
+	rec.run.Status = StatusRunning
+	select {
+	case rec.resumeCh <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (e *Engine) Stop(id string) error { return e.StopInRepo("", id) }
+
+func (e *Engine) StopInRepo(repo, id string) error {
+	rec, err := e.getRecInRepo(repo, id)
+	if err != nil {
+		return err
+	}
+	rec.mu.Lock()
+	rec.stopped = true
+	rec.pauseReq = false
+	cmds := append([]*exec.Cmd(nil), rec.cmds...)
+	if rec.run.Status == StatusPaused {
+		select {
+		case rec.resumeCh <- struct{}{}:
+		default:
+		}
+	}
+	rec.mu.Unlock()
+	for _, cmd := range cmds {
+		sigterm(cmd)
+	}
+	return nil
+}
+
+func (e *Engine) Rewind(id, stepID string) error { return e.RewindInRepo("", id, stepID) }
+
+func (e *Engine) RewindInRepo(repo, id, stepID string) error {
+	rec, err := e.getRecInRepo(repo, id)
 	if err != nil {
 		return err
 	}
@@ -478,80 +675,6 @@ func (e *Engine) Rewind(id, stepID string) error {
 	rec.rewindTo = idx
 	_ = rec.jl.Append(map[string]any{"type": "workflow_rewound", "runId": id, "stepId": stepID})
 	return nil
-}
-
-func stepIndex(ids []string, id string) int {
-	for i, s := range ids {
-		if s == id {
-			return i
-		}
-	}
-	return -1
-}
-
-func (e *Engine) Pause(id string) error {
-	rec, err := e.getRec(id)
-	if err != nil {
-		return err
-	}
-	rec.mu.Lock()
-	defer rec.mu.Unlock()
-	if rec.stopped {
-		return fmt.Errorf("WorkflowRun %q is stopped", id)
-	}
-	rec.pauseReq = true
-	return nil
-}
-
-func (e *Engine) Resume(id string) error {
-	rec, err := e.getRec(id)
-	if err != nil {
-		return err
-	}
-	rec.mu.Lock()
-	defer rec.mu.Unlock()
-	if rec.run.Status != StatusPaused {
-		return fmt.Errorf("WorkflowRun %q is not paused", id)
-	}
-	rec.pauseReq = false
-	rec.run.Status = StatusRunning
-	select {
-	case rec.resumeCh <- struct{}{}:
-	default:
-	}
-	return nil
-}
-
-func (e *Engine) Stop(id string) error {
-	rec, err := e.getRec(id)
-	if err != nil {
-		return err
-	}
-	rec.mu.Lock()
-	rec.stopped = true
-	rec.pauseReq = false
-	cmds := append([]*exec.Cmd(nil), rec.cmds...)
-	if rec.run.Status == StatusPaused {
-		select {
-		case rec.resumeCh <- struct{}{}:
-		default:
-		}
-	}
-	rec.mu.Unlock()
-	for _, cmd := range cmds {
-		sigterm(cmd)
-	}
-	return nil
-}
-
-func (e *Engine) getRec(id string) (*runRec, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	rec, ok := e.runs[id]
-	if !ok {
-		return nil, fmt.Errorf("WorkflowRun %q not found", id)
-	}
-	return rec, nil
 }
 
 func (rec *runRec) setStatus(status string) {
@@ -646,10 +769,15 @@ func sigterm(cmd *exec.Cmd) {
 }
 
 // Follow sends JSONL history then live appends (same map shape as the file).
-// Cold (disk-only) runs stream history then close.
+// Cold (disk-only) runs stream history then close. Legacy: walks StorageRoot.
 func (e *Engine) Follow(id string) (<-chan map[string]any, func(), error) {
+	return e.FollowInRepo("", id)
+}
+
+// FollowInRepo is Follow scoped to StorageRoot/<repo>/<id>/.
+func (e *Engine) FollowInRepo(repo, id string) (<-chan map[string]any, func(), error) {
 	e.mu.Lock()
-	rec, ok := e.runs[id]
+	rec, ok := e.runs[runKey(repo, id)]
 	e.mu.Unlock()
 
 	out := make(chan map[string]any, 256)
@@ -658,7 +786,13 @@ func (e *Engine) Follow(id string) (<-chan map[string]any, func(), error) {
 	cancel := func() { once.Do(func() { close(stop) }) }
 
 	if !ok {
-		_, path, err := e.loadFromDisk(id)
+		var path string
+		var err error
+		if repo != "" {
+			_, path, err = e.loadFromDiskInRepo(repo, id)
+		} else {
+			_, path, err = e.loadFromDisk(id)
+		}
 		if err != nil {
 			return nil, nil, err
 		}
@@ -715,6 +849,58 @@ func (e *Engine) GetWorkflow(id string) (*Workflow, error) {
 		return nil, err
 	}
 	return toWorkflowView(wf), nil
+}
+
+// ListWorkflows returns Workflows under StorageRoot/<repo>/workflows/*.yaml.
+func (e *Engine) ListWorkflows(repo string) ([]Workflow, error) {
+	dir := filepath.Join(e.cfg.StorageRoot, repo, "workflows")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []Workflow{}, nil
+		}
+		return nil, err
+	}
+	out := []Workflow{}
+	for _, ent := range entries {
+		name := ent.Name()
+		if ent.IsDir() || filepath.Ext(name) != ".yaml" {
+			continue
+		}
+		id := strings.TrimSuffix(name, ".yaml")
+		wf, err := e.loadWorkflowInRepo(repo, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *toWorkflowView(wf))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// GetWorkflowInRepo loads one Workflow from StorageRoot/<repo>/workflows/<id>.yaml.
+func (e *Engine) GetWorkflowInRepo(repo, id string) (*Workflow, error) {
+	wf, err := e.loadWorkflowInRepo(repo, id)
+	if err != nil {
+		return nil, err
+	}
+	return toWorkflowView(wf), nil
+}
+
+func (e *Engine) loadWorkflowInRepo(repo, id string) (*workflowDef, error) {
+	path := filepath.Join(e.cfg.StorageRoot, repo, "workflows", id+".yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("load workflow %q/%q: %w", repo, id, err)
+	}
+	var wf workflowDef
+	if err := yaml.Unmarshal(data, &wf); err != nil {
+		return nil, err
+	}
+	if wf.ID == "" {
+		wf.ID = id
+	}
+	return &wf, nil
 }
 
 func toWorkflowView(wf *workflowDef) *Workflow {
@@ -802,12 +988,12 @@ func (e *Engine) loadWorkflow(id string) (*workflowDef, error) {
 	return &wf, nil
 }
 
-func (e *Engine) runSeries(rec *runRec, project string, step stepDef, env []string, argOverrides map[string][]string, jl *jsonl) error {
+func (e *Engine) runSeries(rec *runRec, repoPath string, step stepDef, env []string, argOverrides map[string][]string, jl *jsonl) error {
 	for _, p := range step.Processes {
 		if rec.isStopped() {
 			return fmt.Errorf("stopped")
 		}
-		pr, err := e.runProcess(rec, project, p, env, argOverrides, jl, nil)
+		pr, err := e.runProcess(rec, repoPath, p, env, argOverrides, jl, nil)
 		pr.StepID = step.ID
 		rec.appendProcessRun(pr)
 		if err != nil {
@@ -817,7 +1003,7 @@ func (e *Engine) runSeries(rec *runRec, project string, step stepDef, env []stri
 	return nil
 }
 
-func (e *Engine) runParallel(rec *runRec, project string, step stepDef, env []string, argOverrides map[string][]string, jl *jsonl) error {
+func (e *Engine) runParallel(rec *runRec, repoPath string, step stepDef, env []string, argOverrides map[string][]string, jl *jsonl) error {
 	type slot struct {
 		def  processDef
 		cmd  *exec.Cmd
@@ -826,7 +1012,7 @@ func (e *Engine) runParallel(rec *runRec, project string, step stepDef, env []st
 	}
 	slots := make([]*slot, len(step.Processes))
 	for i, p := range step.Processes {
-		cmd, err := e.startCmd(project, p, env, argOverrides, jl)
+		cmd, err := e.startCmd(repoPath, p, env, argOverrides, jl)
 		if err != nil {
 			return err
 		}
@@ -889,7 +1075,7 @@ func (e *Engine) runParallel(rec *runRec, project string, step stepDef, env []st
 	return firstErr
 }
 
-func (e *Engine) runDecision(rec *runRec, project string, step stepDef, inputs map[string]string, env []string, argOverrides map[string][]string, jl *jsonl) error {
+func (e *Engine) runDecision(rec *runRec, repoPath string, step stepDef, inputs map[string]string, env []string, argOverrides map[string][]string, jl *jsonl) error {
 	var matched []processDef
 	for _, p := range step.Processes {
 		ok, err := predicateMatches(p.When, inputs)
@@ -910,7 +1096,7 @@ func (e *Engine) runDecision(rec *runRec, project string, step stepDef, inputs m
 		}
 		return fmt.Errorf("decision step %q: multiple processes matched: %v", step.ID, ids)
 	}
-	pr, err := e.runProcess(rec, project, matched[0], env, argOverrides, jl, nil)
+	pr, err := e.runProcess(rec, repoPath, matched[0], env, argOverrides, jl, nil)
 	pr.StepID = step.ID
 	rec.appendProcessRun(pr)
 	return err
@@ -918,8 +1104,8 @@ func (e *Engine) runDecision(rec *runRec, project string, step stepDef, inputs m
 
 // runLoop runs Processes then returns steps[] delta: -1 previous, +1 next.
 // when true → previous; when false/nil-match → next.
-func (e *Engine) runLoop(rec *runRec, project string, step stepDef, inputs map[string]string, env []string, argOverrides map[string][]string, jl *jsonl, idx int) (int, error) {
-	if err := e.runSeries(rec, project, step, env, argOverrides, jl); err != nil {
+func (e *Engine) runLoop(rec *runRec, repoPath string, step stepDef, inputs map[string]string, env []string, argOverrides map[string][]string, jl *jsonl, idx int) (int, error) {
+	if err := e.runSeries(rec, repoPath, step, env, argOverrides, jl); err != nil {
 		return 0, err
 	}
 	back, err := predicateMatches(step.When, inputs)
@@ -975,8 +1161,8 @@ func predicateMatches(p *predicateDef, inputs map[string]string) (bool, error) {
 	}
 }
 
-func (e *Engine) runProcess(rec *runRec, project string, p processDef, env []string, argOverrides map[string][]string, jl *jsonl, termFlag *atomic.Bool) (ProcessRun, error) {
-	cmd, err := e.startCmd(project, p, env, argOverrides, jl)
+func (e *Engine) runProcess(rec *runRec, repoPath string, p processDef, env []string, argOverrides map[string][]string, jl *jsonl, termFlag *atomic.Bool) (ProcessRun, error) {
+	cmd, err := e.startCmd(repoPath, p, env, argOverrides, jl)
 	if err != nil {
 		return ProcessRun{ProcessID: p.ID, Status: StatusFailed}, err
 	}
@@ -996,15 +1182,15 @@ func (e *Engine) runProcess(rec *runRec, project string, p processDef, env []str
 	return pr, err
 }
 
-func (e *Engine) startCmd(project string, p processDef, env []string, argOverrides map[string][]string, jl *jsonl) (*exec.Cmd, error) {
+func (e *Engine) startCmd(repoPath string, p processDef, env []string, argOverrides map[string][]string, jl *jsonl) (*exec.Cmd, error) {
 	_ = jl.Append(map[string]any{"type": "process_started", "processId": p.ID, "command": p.Command})
 
-	cwd := project
+	cwd := repoPath
 	if p.WorkingDirectory != "" {
 		if filepath.IsAbs(p.WorkingDirectory) {
 			cwd = p.WorkingDirectory
 		} else {
-			cwd = filepath.Join(project, p.WorkingDirectory)
+			cwd = filepath.Join(repoPath, p.WorkingDirectory)
 		}
 	}
 
@@ -1148,6 +1334,19 @@ func (e *Engine) loadFromDisk(id string) (*WorkflowRun, string, error) {
 		run.ID = id
 	}
 	return run, found, nil
+}
+
+func (e *Engine) loadFromDiskInRepo(repo, id string) (*WorkflowRun, string, error) {
+	path := filepath.Join(e.cfg.StorageRoot, repo, id, "events.jsonl")
+	events, err := readJSONLFile(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("WorkflowRun %q not found in repo %q", id, repo)
+	}
+	run := reconstructRun(events)
+	if run.ID == "" {
+		run.ID = id
+	}
+	return run, path, nil
 }
 
 func reconstructRun(events []map[string]any) *WorkflowRun {

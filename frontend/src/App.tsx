@@ -1,6 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
-import { API_BASE, api, type StartRequest, type TimelineEvent, type Workflow, type WorkflowRun } from "./api/client";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  API_BASE,
+  api,
+  type Repo,
+  type TimelineEvent,
+  type Workflow,
+  type WorkflowRun,
+} from "./api/client";
 import { Canvas, type StepStatus } from "./canvas/Canvas";
+
+function wsURL(path: string) {
+  return `${API_BASE.replace(/^http/, "ws")}${path}`;
+}
 
 /** Parse "step.input=value" lines into InputOverrides. */
 function parseInputOverrides(text: string): Record<string, string> {
@@ -30,12 +41,6 @@ function parseArgOverrides(text: string): Record<string, string[]> {
   return out;
 }
 
-function wsURL(path: string) {
-  const base = API_BASE.replace(/^http/, "ws");
-  return `${base}${path}`;
-}
-
-/** Derive Step status from timeline + WorkflowRun.stepRuns (UI never writes YAML). */
 function deriveStepStatus(run: WorkflowRun | null, events: TimelineEvent[]): Record<string, StepStatus> {
   const out: Record<string, StepStatus> = {};
   for (const sr of run?.stepRuns ?? []) {
@@ -61,11 +66,384 @@ function deriveStepStatus(run: WorkflowRun | null, events: TimelineEvent[]): Rec
   return out;
 }
 
-export default function App() {
-  const [workflowId, setWorkflowId] = useState("pipe");
-  const [projectPath, setProjectPath] = useState("");
+function statusTone(status: string | undefined): string {
+  if (!status) return "idle";
+  const s = status.toLowerCase();
+  if (s === "running" || s === "started") return "running";
+  if (s === "succeeded" || s === "success") return "succeeded";
+  if (s === "failed" || s === "error") return "failed";
+  if (s === "stopped") return "stopped";
+  if (s === "paused") return "paused";
+  return "idle";
+}
+
+type Route =
+  | { kind: "home" }
+  | { kind: "workflows"; repo: string }
+  | { kind: "workflow"; repo: string; workflowId: string }
+  | { kind: "run"; repo: string; runId: string }
+  | { kind: "notfound" };
+
+function parseRoute(pathname: string): Route {
+  const parts = pathname.replace(/\/+$/, "").split("/").filter(Boolean);
+  if (parts.length === 0) return { kind: "home" };
+  if (parts[0] === "workflows" && parts.length === 2) {
+    return { kind: "workflows", repo: decodeURIComponent(parts[1]) };
+  }
+  if (parts[0] === "workflows" && parts.length === 3) {
+    return {
+      kind: "workflow",
+      repo: decodeURIComponent(parts[1]),
+      workflowId: decodeURIComponent(parts[2]),
+    };
+  }
+  // /runs/:repo alone is not a collection page
+  if (parts[0] === "runs" && parts.length === 3) {
+    return {
+      kind: "run",
+      repo: decodeURIComponent(parts[1]),
+      runId: decodeURIComponent(parts[2]),
+    };
+  }
+  return { kind: "notfound" };
+}
+
+function navigate(href: string) {
+  window.history.pushState({}, "", href);
+  window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
+function useRoute(): Route {
+  const [route, setRoute] = useState(() => parseRoute(window.location.pathname));
+  useEffect(() => {
+    const sync = () => setRoute(parseRoute(window.location.pathname));
+    window.addEventListener("popstate", sync);
+    return () => window.removeEventListener("popstate", sync);
+  }, []);
+  return route;
+}
+
+function Link({ href, children }: { href: string; children: ReactNode }) {
+  return (
+    <a
+      href={href}
+      onClick={(e) => {
+        if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+        e.preventDefault();
+        navigate(href);
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+
+function Shell({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="debugger">
+      <header className="debugger-header">
+        <div className="debugger-header-inner">
+          <h1 className="debugger-brand">
+            <Link href="/">Subspace</Link>
+          </h1>
+          <div className="debugger-meta">
+            <span className="debugger-status" data-tone="idle">
+              {title}
+            </span>
+          </div>
+        </div>
+      </header>
+      <div className="debugger-body" style={{ padding: "1rem" }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+type HomeWorkflow = Workflow & { repo: string };
+type HomeRun = WorkflowRun & { repo: string };
+
+const HOME_RUN_CAP = 50;
+
+function Home() {
+  const [repos, setRepos] = useState<Repo[]>([]);
+  const [workflows, setWorkflows] = useState<HomeWorkflow[]>([]);
+  const [runs, setRuns] = useState<HomeRun[]>([]);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    void (async () => {
+      const { data, error: err } = await api.GET("/api/repos");
+      if (err) {
+        setError(typeof err === "string" ? err : "failed to list Repos");
+        return;
+      }
+      const list = data ?? [];
+      setRepos(list);
+      // ponytail: client fan-out; aggregate API if repo count hurts latency
+      const wfChunks = await Promise.all(
+        list.map(async (r) => {
+          const res = await api.GET("/api/workflows/{repo}", {
+            params: { path: { repo: r.name } },
+          });
+          return (res.data ?? []).map((w) => ({ ...w, repo: r.name }));
+        }),
+      );
+      const runChunks = await Promise.all(
+        list.map(async (r) => {
+          const res = await api.GET("/api/runs/{repo}", {
+            params: { path: { repo: r.name } },
+          });
+          return (res.data ?? []).map((run) => ({ ...run, repo: r.name }));
+        }),
+      );
+      const allWf = wfChunks.flat().sort((a, b) => {
+        const byRepo = a.repo.localeCompare(b.repo);
+        if (byRepo !== 0) return byRepo;
+        return (a.id ?? "").localeCompare(b.id ?? "");
+      });
+      const allRuns = runChunks
+        .flat()
+        .sort((a, b) => (b.id ?? "").localeCompare(a.id ?? ""))
+        .slice(0, HOME_RUN_CAP);
+      setWorkflows(allWf);
+      setRuns(allRuns);
+    })();
+  }, []);
+  return (
+    <Shell title="Home">
+      {error && <p className="debugger-error">{error}</p>}
+      {repos.length === 0 ? (
+        <p className="muted">No Repos registered. Use subspace repo add.</p>
+      ) : (
+        <>
+          <h2 style={{ fontSize: "1rem" }}>Repos</h2>
+          <ul className="history-list">
+            {repos.map((r) => (
+              <li key={r.name}>
+                <Link href={`/workflows/${encodeURIComponent(r.name)}`}>{r.name}</Link>
+                <span> · {r.absolutePath}</span>
+              </li>
+            ))}
+          </ul>
+          <h2 style={{ marginTop: "1.5rem", fontSize: "1rem" }}>Workflows</h2>
+          {workflows.length === 0 ? (
+            <p className="muted">No Workflows yet.</p>
+          ) : (
+            <ul className="history-list">
+              {workflows.map((w) => (
+                <li key={`${w.repo}/${w.id}`}>
+                  <Link
+                    href={`/workflows/${encodeURIComponent(w.repo)}/${encodeURIComponent(w.id)}`}
+                  >
+                    {w.name || w.id}
+                  </Link>
+                  <span>
+                    {" "}
+                    · {w.repo} · {w.id}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <h2 style={{ marginTop: "1.5rem", fontSize: "1rem" }}>Recent WorkflowRuns</h2>
+          {runs.length === 0 ? (
+            <p className="muted">No WorkflowRuns yet.</p>
+          ) : (
+            <ul className="history-list">
+              {runs.map((r) => (
+                <li key={`${r.repo}/${r.id}`}>
+                  <Link href={`/runs/${encodeURIComponent(r.repo)}/${encodeURIComponent(r.id)}`}>
+                    {r.id}
+                  </Link>
+                  <span>
+                    {" "}
+                    · {r.repo} · {r.workflowId} · {r.status}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </Shell>
+  );
+}
+
+function WorkflowList({ repo }: { repo: string }) {
+  const [list, setList] = useState<Workflow[]>([]);
+  const [runs, setRuns] = useState<WorkflowRun[]>([]);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    void (async () => {
+      const wfRes = await api.GET("/api/workflows/{repo}", {
+        params: { path: { repo } },
+      });
+      if (wfRes.response?.status === 404) {
+        setError(`Unknown Repo: ${repo}`);
+        return;
+      }
+      if (wfRes.error || !wfRes.data) {
+        setError(typeof wfRes.error === "string" ? wfRes.error : "failed to list Workflows");
+        return;
+      }
+      setList(wfRes.data);
+      const runRes = await api.GET("/api/runs/{repo}", {
+        params: { path: { repo } },
+      });
+      if (!runRes.error && runRes.data) {
+        setRuns(runRes.data.slice(0, 50));
+      }
+    })();
+  }, [repo]);
+  return (
+    <Shell title={`Workflows · ${repo}`}>
+      <p>
+        <Link href="/">← Repos</Link>
+      </p>
+      {error && <p className="debugger-error">{error}</p>}
+      {!error && list.length === 0 && <p className="muted">No Workflows in this Repo.</p>}
+      <ul className="history-list">
+        {list.map((w) => (
+          <li key={w.id}>
+            <Link href={`/workflows/${encodeURIComponent(repo)}/${encodeURIComponent(w.id)}`}>
+              {w.name || w.id}
+            </Link>
+            <span> · {w.id}</span>
+          </li>
+        ))}
+      </ul>
+      {!error && (
+        <>
+          <h2 style={{ marginTop: "1.5rem", fontSize: "1rem" }}>Recent WorkflowRuns</h2>
+          {runs.length === 0 ? (
+            <p className="muted">No WorkflowRuns yet.</p>
+          ) : (
+            <ul className="history-list">
+              {runs.map((r) => (
+                <li key={r.id}>
+                  <Link href={`/runs/${encodeURIComponent(repo)}/${encodeURIComponent(r.id)}`}>
+                    {r.id}
+                  </Link>
+                  <span>
+                    {" "}
+                    · {r.workflowId} · {r.status}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </Shell>
+  );
+}
+
+function WorkflowCanvas({ repo, workflowId }: { repo: string; workflowId: string }) {
+  const [workflow, setWorkflow] = useState<Workflow | null>(null);
+  const [error, setError] = useState("");
+  const [starting, setStarting] = useState(false);
   const [inputOverrideText, setInputOverrideText] = useState("");
   const [argOverrideText, setArgOverrideText] = useState("");
+  useEffect(() => {
+    void (async () => {
+      const { data, error: err, response } = await api.GET("/api/workflows/{repo}/{workflowId}", {
+        params: { path: { repo, workflowId } },
+      });
+      if (response?.status === 404) {
+        setError(`Unknown Repo or Workflow: ${repo}/${workflowId}`);
+        return;
+      }
+      if (err || !data) {
+        setError(typeof err === "string" ? err : "failed to load Workflow");
+        return;
+      }
+      setWorkflow(data);
+    })();
+  }, [repo, workflowId]);
+
+  async function startRun() {
+    setStarting(true);
+    setError("");
+    const body: {
+      workflowId: string;
+      inputOverrides?: Record<string, string>;
+      argumentOverrides?: Record<string, string[]>;
+    } = { workflowId };
+    const inputs = parseInputOverrides(inputOverrideText);
+    if (Object.keys(inputs).length) body.inputOverrides = inputs;
+    const args = parseArgOverrides(argOverrideText);
+    if (Object.keys(args).length) body.argumentOverrides = args;
+    const { data, error: err, response } = await api.POST("/api/runs/{repo}", {
+      params: { path: { repo } },
+      body,
+    });
+    setStarting(false);
+    if (response?.status === 404) {
+      setError(`Unknown Repo: ${repo}`);
+      return;
+    }
+    if (err || !data) {
+      setError(typeof err === "string" ? err : "failed to start WorkflowRun");
+      return;
+    }
+    navigate(`/runs/${encodeURIComponent(repo)}/${encodeURIComponent(data.id)}`);
+  }
+
+  return (
+    <Shell title={workflow?.name ?? workflowId}>
+      <p>
+        <Link href={`/workflows/${encodeURIComponent(repo)}`}>← {repo}</Link>
+      </p>
+      {error && <p className="debugger-error">{error}</p>}
+      {workflow && (
+        <div className="debugger-split" style={{ minHeight: "60vh" }}>
+          <div className="debugger-canvas">
+            <p style={{ marginBottom: "0.75rem" }}>
+              <button type="button" onClick={() => void startRun()} disabled={starting}>
+                {starting ? "Starting…" : "Start WorkflowRun"}
+              </button>
+            </p>
+            <div className="wf-canvas">
+              <Canvas
+                steps={workflow.steps}
+                connections={workflow.connections}
+                stepStatus={{}}
+              />
+            </div>
+            <p className="muted" style={{ marginTop: "0.75rem" }}>
+              Read-only canvas. Edit Workflow YAML on disk. Working tree is the Repo path.
+            </p>
+          </div>
+          <aside className="debugger-panel">
+            <section className="panel-section">
+              <h2>Overrides</h2>
+              <label className="field">
+                Input overrides
+                <textarea
+                  value={inputOverrideText}
+                  onChange={(e) => setInputOverrideText(e.target.value)}
+                  rows={3}
+                  placeholder="step.input=value per line"
+                />
+              </label>
+              <label className="field">
+                Argument overrides
+                <textarea
+                  value={argOverrideText}
+                  onChange={(e) => setArgOverrideText(e.target.value)}
+                  rows={3}
+                  placeholder="processId=arg1,arg2 per line"
+                />
+              </label>
+            </section>
+          </aside>
+        </div>
+      )}
+    </Shell>
+  );
+}
+
+function RunDebugger({ repo, runId }: { repo: string; runId: string }) {
   const [run, setRun] = useState<WorkflowRun | null>(null);
   const [workflow, setWorkflow] = useState<Workflow | null>(null);
   const [events, setEvents] = useState<TimelineEvent[]>([]);
@@ -73,13 +451,39 @@ export default function App() {
   const [rewindStepId, setRewindStepId] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [history, setHistory] = useState<WorkflowRun[]>([]);
-
   const stepStatus = useMemo(() => deriveStepStatus(run, events), [run, events]);
 
   useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const { data, error: err, response } = await api.GET("/api/runs/{repo}/{runId}", {
+        params: { path: { repo, runId } },
+      });
+      if (cancelled) return;
+      if (response?.status === 404) {
+        setError(`Unknown Repo or WorkflowRun: ${repo}/${runId}`);
+        return;
+      }
+      if (err || !data) {
+        setError(typeof err === "string" ? err : "failed to load WorkflowRun");
+        return;
+      }
+      setRun(data);
+      const wf = await api.GET("/api/workflows/{repo}/{workflowId}", {
+        params: { path: { repo, workflowId: data.workflowId } },
+      });
+      if (!cancelled && wf.data) setWorkflow(wf.data);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [repo, runId]);
+
+  useEffect(() => {
     if (!run?.id) return;
-    const ws = new WebSocket(wsURL(`/api/runs/${run.id}/events`));
+    setEvents([]);
+    const path = `/api/runs/${encodeURIComponent(repo)}/${encodeURIComponent(run.id)}/events`;
+    const ws = new WebSocket(wsURL(path));
     ws.onmessage = (msg) => {
       const ev = JSON.parse(msg.data) as TimelineEvent;
       setEvents((prev) => [...prev, ev]);
@@ -97,116 +501,20 @@ export default function App() {
     };
     ws.onerror = () => setError("WebSocket error");
     return () => ws.close();
-  }, [run?.id, timelineKey]);
-
-  async function loadWorkflow(id = workflowId) {
-    setBusy(true);
-    setError("");
-    try {
-      const { data, error: err } = await api.GET("/api/workflows/{id}", {
-        params: { path: { id } },
-      });
-      if (err || !data) throw new Error(typeof err === "string" ? err : "getWorkflow failed");
-      setWorkflow(data);
-      if (!projectPath && data.defaultProject) setProjectPath(data.defaultProject);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function start() {
-    setBusy(true);
-    setError("");
-    setEvents([]);
-    try {
-      if (!workflow || workflow.id !== workflowId) {
-        const { data: wf, error: werr } = await api.GET("/api/workflows/{id}", {
-          params: { path: { id: workflowId } },
-        });
-        if (werr || !wf) throw new Error(typeof werr === "string" ? werr : "getWorkflow failed");
-        setWorkflow(wf);
-        if (!projectPath && wf.defaultProject) setProjectPath(wf.defaultProject);
-      }
-      const body: StartRequest = { workflowId };
-      if (projectPath) body.projectPath = projectPath;
-      const inputs = parseInputOverrides(inputOverrideText);
-      if (Object.keys(inputs).length) body.inputOverrides = inputs;
-      const args = parseArgOverrides(argOverrideText);
-      if (Object.keys(args).length) body.argumentOverrides = args;
-      const { data, error: err } = await api.POST("/api/runs", { body });
-      if (err || !data) throw new Error(typeof err === "string" ? err : "startRun failed");
-      setRun(data);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function refresh() {
-    if (!run) return;
-    setBusy(true);
-    setError("");
-    try {
-      const { data, error: err } = await api.GET("/api/runs/{id}", {
-        params: { path: { id: run.id } },
-      });
-      if (err || !data) throw new Error(typeof err === "string" ? err : "getRun failed");
-      setRun(data);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function reconnect() {
-    if (!run) return;
-    setEvents([]);
-    setTimelineKey((k) => k + 1);
-  }
-
-  async function loadHistory() {
-    setBusy(true);
-    setError("");
-    try {
-      const { data, error: err } = await api.GET("/api/runs", {
-        params: { query: projectPath ? { projectPath } : {} },
-      });
-      if (err || !data) throw new Error(typeof err === "string" ? err : "listRuns failed");
-      setHistory(data);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function reopen(past: WorkflowRun) {
-    setEvents([]);
-    setRun(past);
-    setTimelineKey((k) => k + 1);
-    if (past.workflowId && past.workflowId !== workflow?.id) {
-      setWorkflowId(past.workflowId);
-      await loadWorkflow(past.workflowId);
-    }
-  }
+  }, [repo, run?.id, timelineKey]);
 
   async function control(action: "pause" | "resume" | "stop") {
-    if (!run) return;
     setBusy(true);
     setError("");
     try {
       const path =
         action === "pause"
-          ? "/api/runs/{id}/pause"
+          ? "/api/runs/{repo}/{runId}/pause"
           : action === "resume"
-            ? "/api/runs/{id}/resume"
-            : "/api/runs/{id}/stop";
+            ? "/api/runs/{repo}/{runId}/resume"
+            : "/api/runs/{repo}/{runId}/stop";
       const { data, error: err } = await api.POST(path, {
-        params: { path: { id: run.id } },
+        params: { path: { repo, runId } },
       });
       if (err || !data) throw new Error(typeof err === "string" ? err : `${action} failed`);
       setRun(data);
@@ -218,12 +526,12 @@ export default function App() {
   }
 
   async function rewind() {
-    if (!run || !rewindStepId.trim()) return;
+    if (!rewindStepId.trim()) return;
     setBusy(true);
     setError("");
     try {
-      const { data, error: err } = await api.POST("/api/runs/{id}/rewind", {
-        params: { path: { id: run.id } },
+      const { data, error: err } = await api.POST("/api/runs/{repo}/{runId}/rewind", {
+        params: { path: { repo, runId } },
         body: { stepId: rewindStepId.trim() },
       });
       if (err || !data) throw new Error(typeof err === "string" ? err : "rewind failed");
@@ -235,112 +543,157 @@ export default function App() {
     }
   }
 
+  async function refresh() {
+    setBusy(true);
+    setError("");
+    try {
+      const { data, error: err } = await api.GET("/api/runs/{repo}/{runId}", {
+        params: { path: { repo, runId } },
+      });
+      if (err || !data) throw new Error(typeof err === "string" ? err : "getRun failed");
+      setRun(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const tone = statusTone(run?.status);
+
   return (
-    <main style={{ fontFamily: "system-ui", maxWidth: 960, margin: "1.5rem auto", padding: "0 1rem" }}>
-      <h1>Subspace</h1>
-      <p style={{ color: "#555", marginTop: -8 }}>Canvas debugger (phase 1 — definition YAML is read-only)</p>
+    <div className="debugger">
+      <header className="debugger-header">
+        <div className="debugger-header-inner">
+          <h1 className="debugger-brand">
+            <Link href="/">Subspace</Link>
+          </h1>
+          <div className="debugger-meta">
+            <span className="debugger-status" data-tone={tone}>
+              {run?.status ?? "loading"}
+            </span>
+            <span className="debugger-run-id">{runId}</span>
+            <Link href={`/workflows/${encodeURIComponent(repo)}`}>{repo}</Link>
+            {run && (
+              <Link
+                href={`/workflows/${encodeURIComponent(repo)}/${encodeURIComponent(run.workflowId)}`}
+              >
+                {run.workflowId}
+              </Link>
+            )}
+          </div>
+          <div className="toolbar" role="toolbar" aria-label="WorkflowRun controls">
+            <button className="btn-pause" disabled={busy || !run} onClick={() => void control("pause")}>
+              Pause
+            </button>
+            <button className="btn-start" disabled={busy || !run} onClick={() => void control("resume")}>
+              Resume
+            </button>
+            <button className="btn-stop" disabled={busy || !run} onClick={() => void control("stop")}>
+              Stop
+            </button>
+            <button
+              className="btn-rewind"
+              disabled={busy || !run || !rewindStepId.trim()}
+              onClick={() => void rewind()}
+            >
+              Rewind
+            </button>
+            <button disabled={busy || !run} onClick={() => void refresh()}>
+              Refresh
+            </button>
+            <button
+              disabled={!run}
+              onClick={() => {
+                setEvents([]);
+                setTimelineKey((k) => k + 1);
+              }}
+            >
+              Reconnect
+            </button>
+          </div>
+        </div>
+      </header>
 
-      {workflow && (
-        <section style={{ marginTop: 12 }}>
-          <h2 style={{ fontSize: "1rem", marginBottom: 8 }}>
-            Canvas · {workflow.id}
-            {run ? ` · run ${run.id} (${run.status})` : ""}
-          </h2>
-          <Canvas
-            steps={workflow.steps}
-            connections={workflow.connections}
-            stepStatus={stepStatus}
-            cursorStepId={run?.cursorStepId}
-            onSelectStep={setRewindStepId}
-          />
-        </section>
-      )}
-
-      <label>
-        Workflow ID
-        <input value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} style={{ display: "block", width: "100%" }} />
-      </label>
-      <label style={{ display: "block", marginTop: 8 }}>
-        Project path (override; empty uses Workflow default)
-        <input value={projectPath} onChange={(e) => setProjectPath(e.target.value)} style={{ display: "block", width: "100%" }} />
-      </label>
-      <label style={{ display: "block", marginTop: 8 }}>
-        Input overrides (step.input=value per line)
-        <textarea value={inputOverrideText} onChange={(e) => setInputOverrideText(e.target.value)} rows={3} style={{ display: "block", width: "100%" }} />
-      </label>
-      <label style={{ display: "block", marginTop: 8 }}>
-        Argument overrides (processId=arg1,arg2 per line)
-        <textarea value={argOverrideText} onChange={(e) => setArgOverrideText(e.target.value)} rows={3} style={{ display: "block", width: "100%" }} />
-      </label>
-      <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
-        <button disabled={busy} onClick={() => loadWorkflow()}>
-          Load canvas
-        </button>
-        <button disabled={busy} onClick={start}>
-          Start
-        </button>
-        <button disabled={busy || !run} onClick={refresh}>
-          Refresh status
-        </button>
-        <button disabled={busy || !run} onClick={() => control("pause")}>
-          Pause
-        </button>
-        <button disabled={busy || !run} onClick={() => control("resume")}>
-          Resume
-        </button>
-        <button disabled={busy || !run} onClick={() => control("stop")}>
-          Stop
-        </button>
-        <button disabled={!run} onClick={reconnect}>
-          Reconnect timeline
-        </button>
-        <button disabled={busy} onClick={loadHistory}>
-          List runs
-        </button>
-      </div>
-      {history.length > 0 && (
-        <section style={{ marginTop: 12 }}>
-          <h2 style={{ fontSize: "1rem" }}>Run history</h2>
-          <ul style={{ listStyle: "none", padding: 0, margin: 0, fontFamily: "ui-monospace, monospace", fontSize: 13 }}>
-            {history.map((h) => (
-              <li key={h.id} style={{ borderBottom: "1px solid #ddd", padding: "4px 0", display: "flex", gap: 8, alignItems: "center" }}>
-                <button disabled={busy} onClick={() => reopen(h)} style={{ fontSize: 12 }}>
-                  Open
-                </button>
-                <span>
-                  {h.id} · {h.workflowId} · {h.status}
+      <div className="debugger-body">
+        {error && <p className="debugger-error">{error}</p>}
+        <div className="debugger-split">
+          <div className="debugger-canvas">
+            {workflow ? (
+              <div className="wf-canvas">
+                <Canvas
+                  steps={workflow.steps}
+                  connections={workflow.connections}
+                  stepStatus={stepStatus}
+                  cursorStepId={run?.cursorStepId}
+                  onSelectStep={setRewindStepId}
+                />
+              </div>
+            ) : (
+              <div className="canvas-empty">Loading Workflow canvas…</div>
+            )}
+          </div>
+          <aside className="debugger-panel">
+            <section className="panel-section">
+              <h2>Rewind</h2>
+              <label className="field">
+                Step ID (click a canvas Step)
+                <span className="inline-row">
+                  <input value={rewindStepId} onChange={(e) => setRewindStepId(e.target.value)} />
+                  <button
+                    className="panel-btn danger"
+                    disabled={busy || !run || !rewindStepId.trim()}
+                    onClick={() => void rewind()}
+                  >
+                    Rewind
+                  </button>
                 </span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-      <label style={{ display: "block", marginTop: 8 }}>
-        Rewind to Step ID (click a canvas Step to fill)
-        <span style={{ display: "flex", gap: 8, marginTop: 4 }}>
-          <input value={rewindStepId} onChange={(e) => setRewindStepId(e.target.value)} style={{ flex: 1 }} />
-          <button disabled={busy || !run || !rewindStepId.trim()} onClick={rewind}>
-            Rewind
-          </button>
-        </span>
-      </label>
-      {error && <p style={{ color: "crimson" }}>{error}</p>}
-      {events.length > 0 && (
-        <section style={{ marginTop: 16 }}>
-          <h2 style={{ fontSize: "1rem" }}>Timeline</h2>
-          <ol style={{ listStyle: "none", padding: 0, margin: 0, fontFamily: "ui-monospace, monospace", fontSize: 13, maxHeight: 240, overflow: "auto" }}>
-            {events.map((ev, i) => (
-              <li key={i} style={{ borderBottom: "1px solid #ddd", padding: "4px 0" }}>
-                <span style={{ color: "#666" }}>{ev.type}</span>
-                {ev.stepId != null && <span> {ev.stepId}</span>}
-                {typeof ev.iteration === "number" && ev.iteration > 0 && <span> iter={String(ev.iteration)}</span>}
-                {ev.data != null && <span> {ev.data}</span>}
-                {ev.processId != null && ev.data == null && <span> {ev.processId}</span>}
-              </li>
-            ))}
-          </ol>
-        </section>
-      )}
-    </main>
+              </label>
+            </section>
+            <section className="panel-section">
+              <h2>Timeline</h2>
+              {events.length === 0 ? (
+                <p className="muted">Timeline events appear when the WebSocket connects.</p>
+              ) : (
+                <ol className="timeline-list">
+                  {events.map((ev, i) => (
+                    <li key={i}>
+                      <span className="timeline-type">{ev.type}</span>
+                      {ev.stepId != null && <span> {ev.stepId}</span>}
+                      {typeof ev.iteration === "number" && ev.iteration > 0 && (
+                        <span> iter={String(ev.iteration)}</span>
+                      )}
+                      {ev.data != null && <span> {ev.data}</span>}
+                      {ev.processId != null && ev.data == null && <span> {ev.processId}</span>}
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </section>
+          </aside>
+        </div>
+      </div>
+    </div>
   );
+}
+
+export default function App() {
+  const route = useRoute();
+  switch (route.kind) {
+    case "home":
+      return <Home />;
+    case "workflows":
+      return <WorkflowList repo={route.repo} />;
+    case "workflow":
+      return <WorkflowCanvas repo={route.repo} workflowId={route.workflowId} />;
+    case "run":
+      return <RunDebugger repo={route.repo} runId={route.runId} />;
+    default:
+      return (
+        <Shell title="Not found">
+          <p className="debugger-error">Unknown path.</p>
+          <Link href="/">Home</Link>
+        </Shell>
+      );
+  }
 }

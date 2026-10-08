@@ -4,3 +4,4 @@ frontend/dist/
 backend/subspace
 .DS_Store
 *.log
+start.local

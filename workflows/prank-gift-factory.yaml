@@ -1,0 +1,180 @@
+id: prank-gift-factory
+name: Prank Gift Factory
+steps:
+  - id: intake
+    name: Intake Order
+    mode: series
+    visualization:
+      position: { x: 24, y: 120 }
+    outputs:
+      - name: gag
+        value: whoopie
+      - name: latch_ok
+        value: "no"
+    processes:
+      - id: stamp-ticket
+        name: Stamp Ticket
+        command: sh
+        arguments: ["-c", "echo intake"]
+
+  - id: choose-gag
+    name: Choose Gag
+    mode: decision
+    visualization:
+      position: { x: 212, y: 120 }
+    inputs:
+      - name: gag
+        source:
+          stepId: intake
+          output: gag
+    processes:
+      - id: whoopie
+        name: Whoopie Cushion
+        when:
+          eq:
+            input: gag
+            value: whoopie
+        command: sh
+        arguments: ["-c", "echo whoopie"]
+      - id: snake-can
+        name: Snake Can
+        when:
+          eq:
+            input: gag
+            value: snake
+        command: sh
+        arguments: ["-c", "echo snake"]
+      - id: shock-pen
+        name: Shock Pen
+        when:
+          eq:
+            input: gag
+            value: shock
+        command: sh
+        arguments: ["-c", "echo shock"]
+
+  - id: fetch-parts
+    name: Fetch Parts
+    mode: parallel
+    visualization:
+      position: { x: 400, y: 120 }
+    processes:
+      - id: grab-foam
+        name: Grab Foam
+        command: sh
+        arguments: ["-c", "echo foam"]
+      - id: grab-springs
+        name: Grab Springs
+        command: sh
+        arguments: ["-c", "echo springs"]
+
+  - id: mold-shell
+    name: Mold Shell
+    mode: series
+    visualization:
+      position: { x: 588, y: 120 }
+    processes:
+      - id: heat-press
+        name: Heat Press
+        command: sh
+        arguments: ["-c", "echo mold"]
+
+  - id: load-payload
+    name: Load Payload
+    mode: series
+    visualization:
+      position: { x: 588, y: 120 }
+    processes:
+      - id: stuff
+        name: Stuff Gag
+        command: sh
+        arguments: ["-c", "echo payload"]
+      - id: arm
+        name: Arm Trigger
+        command: sh
+        arguments: ["-c", "echo armed"]
+
+  - id: paint-decoy
+    name: Paint Decoy
+    mode: series
+    visualization:
+      position: { x: 776, y: 120 }
+    processes:
+      - id: airbrush
+        name: Airbrush Fancy
+        command: sh
+        arguments: ["-c", "echo decoy"]
+
+  - id: smell-check
+    name: Smell Check
+    mode: decision
+    visualization:
+      position: { x: 964, y: 120 }
+    inputs:
+      - name: gag
+        source:
+          stepId: intake
+          output: gag
+    processes:
+      - id: pass
+        name: Ship Shape
+        when:
+          exists:
+            input: gag
+        command: sh
+        arguments: ["-c", "echo qc-pass"]
+      - id: reject
+        name: Bin It
+        when:
+          eq:
+            input: gag
+            value: never
+        command: sh
+        arguments: ["-c", "echo qc-fail"]
+
+  - id: wrap-box
+    name: Wrap Box
+    mode: series
+    visualization:
+      position: { x: 1152, y: 120 }
+    processes:
+      - id: ribbon
+        name: Tie Ribbon
+        command: sh
+        arguments: ["-c", "echo wrap"]
+
+  - id: latch-loop
+    name: Retest Latch
+    mode: loop
+    maxIterations: 1
+    visualization:
+      position: { x: 1340, y: 120 }
+    inputs:
+      - name: latch_ok
+        source:
+          stepId: intake
+          output: latch_ok
+    when:
+      eq:
+        input: latch_ok
+        value: "yes"
+    processes:
+      - id: jiggle
+        name: Jiggle Latch
+        command: sh
+        arguments: ["-c", "echo latch"]
+
+  - id: ship
+    name: Ship Bundle
+    mode: parallel
+    visualization:
+      position: { x: 1528, y: 120 }
+    processes:
+      - id: label
+        name: Fake Label
+        command: sh
+        arguments: ["-c", "echo label"]
+      - id: pack
+        name: Pack Truck
+        command: sh
+        arguments: ["-c", "echo ship"]

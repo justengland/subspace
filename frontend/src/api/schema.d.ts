@@ -20,7 +20,39 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/workflows/{id}": {
+    "/api/repos": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listRepos"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workflows/{repo}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listWorkflows"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workflows/{repo}/{workflowId}": {
         parameters: {
             query?: never;
             header?: never;
@@ -36,7 +68,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs": {
+    "/api/runs/{repo}": {
         parameters: {
             query?: never;
             header?: never;
@@ -52,7 +84,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs/{id}": {
+    "/api/runs/{repo}/{runId}": {
         parameters: {
             query?: never;
             header?: never;
@@ -68,7 +100,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs/{id}/pause": {
+    "/api/runs/{repo}/{runId}/pause": {
         parameters: {
             query?: never;
             header?: never;
@@ -84,7 +116,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs/{id}/resume": {
+    "/api/runs/{repo}/{runId}/resume": {
         parameters: {
             query?: never;
             header?: never;
@@ -100,7 +132,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs/{id}/stop": {
+    "/api/runs/{repo}/{runId}/stop": {
         parameters: {
             query?: never;
             header?: never;
@@ -116,7 +148,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs/{id}/rewind": {
+    "/api/runs/{repo}/{runId}/rewind": {
         parameters: {
             query?: never;
             header?: never;
@@ -132,7 +164,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs/{id}/events": {
+    "/api/runs/{repo}/{runId}/events": {
         parameters: {
             query?: never;
             header?: never;
@@ -156,9 +188,14 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        Repo: {
+            name: string;
+            /** @description Absolute path of the Repo working tree */
+            absolutePath: string;
+        };
         StartRequest: {
             workflowId: string;
-            /** @description Override Project; empty uses Workflow.defaultProject */
+            /** @description Optional override; nested start uses Repo registry path when omitted */
             projectPath?: string;
             /** @description stepId.inputName → value */
             inputOverrides?: {
@@ -259,7 +296,10 @@ export interface components {
         };
     };
     parameters: {
-        Id: string;
+        /** @description Registered Repo name */
+        RepoName: string;
+        /** @description WorkflowRun id */
+        RunId: string;
     };
     requestBodies: never;
     headers: never;
@@ -289,12 +329,60 @@ export interface operations {
             };
         };
     };
+    listRepos: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Registered Repos from Subspace home repos.json */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Repo"][];
+                };
+            };
+            500: components["responses"]["TextError"];
+        };
+    };
+    listWorkflows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Workflows for the Repo under Subspace home */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Workflow"][];
+                };
+            };
+            404: components["responses"]["TextError"];
+            500: components["responses"]["TextError"];
+        };
+    };
     getWorkflow: {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["Id"];
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                workflowId: string;
             };
             cookie?: never;
         };
@@ -314,17 +402,17 @@ export interface operations {
     };
     listRuns: {
         parameters: {
-            query?: {
-                /** @description Absolute or relative Project path; empty lists all in-memory runs */
-                projectPath?: string;
-            };
+            query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+            };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description In-memory WorkflowRuns (newest id first) */
+            /** @description WorkflowRuns for the Repo (newest id first) */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -333,14 +421,18 @@ export interface operations {
                     "application/json": components["schemas"]["WorkflowRun"][];
                 };
             };
-            400: components["responses"]["TextError"];
+            404: components["responses"]["TextError"];
+            500: components["responses"]["TextError"];
         };
     };
     startRun: {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+            };
             cookie?: never;
         };
         requestBody: {
@@ -349,7 +441,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Started WorkflowRun */
+            /** @description Started WorkflowRun (execution root from Repo registry) */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -359,6 +451,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["TextError"];
+            404: components["responses"]["TextError"];
         };
     };
     getRun: {
@@ -366,7 +459,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["Id"];
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                /** @description WorkflowRun id */
+                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
@@ -389,7 +485,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["Id"];
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                /** @description WorkflowRun id */
+                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
@@ -405,6 +504,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["TextError"];
+            404: components["responses"]["TextError"];
         };
     };
     resumeRun: {
@@ -412,7 +512,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["Id"];
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                /** @description WorkflowRun id */
+                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
@@ -428,6 +531,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["TextError"];
+            404: components["responses"]["TextError"];
         };
     };
     stopRun: {
@@ -435,7 +539,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["Id"];
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                /** @description WorkflowRun id */
+                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
@@ -451,6 +558,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["TextError"];
+            404: components["responses"]["TextError"];
         };
     };
     rewindRun: {
@@ -458,7 +566,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["Id"];
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                /** @description WorkflowRun id */
+                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
@@ -478,6 +589,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["TextError"];
+            404: components["responses"]["TextError"];
         };
     };
     followRunEvents: {
@@ -485,7 +597,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["Id"];
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                /** @description WorkflowRun id */
+                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };

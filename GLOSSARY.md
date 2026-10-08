@@ -1,11 +1,11 @@
 # Workflow
 
-Local workflow definitions and their executions. Definitions live with the Subspace tool; a WorkflowRun executes Processes against a chosen Project directory (often another repo).
+Local workflow definitions and their executions. A Workflow belongs to a Repo; a WorkflowRun executes Processes against that Repo.
 
 ## Definition
 
 **Workflow**:
-A reusable definition of an entire workflow: Steps, Connections, optional visualization, and an optional default Project. Holds no runtime state.
+A reusable definition of an entire workflow scoped to one Repo: Steps, Connections, optional visualization, and an optional default working tree for that Repo. Holds no runtime state.
 _Avoid_: Pipeline, job definition, playbook
 
 **Step**:
@@ -51,16 +51,16 @@ A Step mode that runs its Processes one after another; the next starts only afte
 
 ## Runtime
 
-**Project**:
-The directory tree where a WorkflowRun executes Processes (their working tree / default cwd). Often a different repo than the one that stores Workflow definitions.
-_Avoid_: Repo (unless you mean a git repository specifically), workspace, target, cwd (cwd is the Process field; Project is the run's root)
+**Repo**:
+A named working tree Subspace runs against. Its name (typically the directory basename) namespaces that Repo's Workflows and WorkflowRuns. Not "any git remote URL" — the local tree Subspace is pointed at.
+_Avoid_: Project, workspace, target, cwd (cwd is the Process field; Repo is the run's root)
 
 **Engine**:
 The component that starts and manages WorkflowRuns: orchestration, Process lifecycle, and run state. Separate from any Workflow definition.
 
 **WorkflowRun**:
-One execution of a Workflow against a Project, including status, timing, and its StepRuns. The debugger drives a WorkflowRun (start, stop, pause, resume, rewind) rather than a separate session type.
-_Avoid_: Execution, job, instance, debug session (say WorkflowRun)
+One execution of a Workflow against a Repo, including status, timing, and its StepRuns. Identified by a short timestamp id that is unique enough in practice. The debugger drives a WorkflowRun (start, stop, pause, resume, rewind) rather than a separate session type.
+_Avoid_: Execution, job, instance, debug session, run (prefer WorkflowRun in prose; run is fine in URLs)
 
 **StepRun**:
 The runtime execution of one Step inside a WorkflowRun, including status, I/O, ProcessRuns, and loop iteration when relevant.
