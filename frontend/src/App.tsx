@@ -1,5 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
-import { API_BASE, api, type StartRequest, type TimelineEvent, type Workflow, type WorkflowRun } from "./api/client";
+import {
+  API_BASE,
+  api,
+  type Repo,
+  type StartRequest,
+  type TimelineEvent,
+  type Workflow,
+  type WorkflowRun,
+} from "./api/client";
 import { Canvas, type StepStatus } from "./canvas/Canvas";
 
 /** Parse "step.input=value" lines into InputOverrides. */
@@ -85,8 +93,16 @@ export default function App() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [history, setHistory] = useState<WorkflowRun[]>([]);
+  const [repos, setRepos] = useState<Repo[]>([]);
 
   const stepStatus = useMemo(() => deriveStepStatus(run, events), [run, events]);
+
+  useEffect(() => {
+    void (async () => {
+      const { data } = await api.GET("/api/repos");
+      setRepos(data ?? []);
+    })();
+  }, []);
 
   useEffect(() => {
     if (!run?.id) return;
@@ -301,6 +317,23 @@ export default function App() {
 
       <div className="debugger-body">
         {error && <p className="debugger-error">{error}</p>}
+
+        <section className="panel-section" style={{ padding: "0.75rem 1rem" }}>
+          <h2>Repos</h2>
+          {repos.length === 0 ? (
+            <p className="muted">No Repos registered. Use subspace repo add.</p>
+          ) : (
+            <ul className="history-list">
+              {repos.map((r) => (
+                <li key={r.name}>
+                  <span>
+                    {r.name} · {r.absolutePath}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
 
         <div className="debugger-split">
           <div className="debugger-canvas">

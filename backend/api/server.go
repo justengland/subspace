@@ -6,10 +6,12 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/justengland/subspace/backend/engine"
+	"github.com/justengland/subspace/backend/registry"
 )
 
 type Server struct {
-	Eng *engine.Engine
+	Eng  *engine.Engine
+	Home string // Subspace home; repos.json lives here
 }
 
 var upgrader = websocket.Upgrader{
@@ -27,10 +29,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/runs/{id}/stop", s.stopRun)
 	mux.HandleFunc("POST /api/runs/{id}/rewind", s.rewindRun)
 	mux.HandleFunc("GET /api/workflows/{id}", s.getWorkflow)
+	mux.HandleFunc("GET /api/repos", s.listRepos)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	return withCORS(mux)
+}
+
+func (s *Server) listRepos(w http.ResponseWriter, _ *http.Request) {
+	repos, err := registry.List(s.Home)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, repos)
 }
 
 func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {

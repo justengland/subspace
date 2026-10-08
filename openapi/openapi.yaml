@@ -22,6 +22,20 @@ paths:
                 properties:
                   status:
                     type: string
+  /api/repos:
+    get:
+      operationId: listRepos
+      responses:
+        "200":
+          description: Registered Repos from Subspace home repos.json
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Repo"
+        "500":
+          $ref: "#/components/responses/TextError"
   /api/workflows/{id}:
     get:
       operationId: getWorkflow
@@ -180,6 +194,15 @@ components:
           schema:
             type: string
   schemas:
+    Repo:
+      type: object
+      required: [name, absolutePath]
+      properties:
+        name:
+          type: string
+        absolutePath:
+          type: string
+          description: Absolute path of the Repo working tree
     StartRequest:
       type: object
       required: [workflowId]
