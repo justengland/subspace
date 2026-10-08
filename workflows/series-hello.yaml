@@ -1,0 +1,13 @@
+id: series-hello
+name: Series Hello
+steps:
+  - id: greet
+    name: Greet
+    mode: series
+    processes:
+      - id: run-a
+        name: Run A
+        command: ./a.sh
+      - id: run-b
+        name: Run B
+        command: ./b.sh
