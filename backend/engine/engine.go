@@ -31,8 +31,10 @@ type Engine struct {
 }
 
 type StartRequest struct {
-	WorkflowID  string `json:"workflowId"`
-	ProjectPath string `json:"projectPath"`
+	WorkflowID         string              `json:"workflowId"`
+	ProjectPath        string              `json:"projectPath,omitempty"` // empty → Workflow.defaultProject
+	InputOverrides     map[string]string   `json:"inputOverrides,omitempty"`     // "stepId.inputName" → value
+	ArgumentOverrides  map[string][]string `json:"argumentOverrides,omitempty"`  // processId → args
 }
 
 type WorkflowRun struct {
@@ -52,10 +54,11 @@ type Connection struct {
 
 // Workflow is the Engine-facing definition view (Connections derived on read).
 type Workflow struct {
-	ID          string       `json:"id"`
-	Name        string       `json:"name"`
-	Steps       []StepView   `json:"steps"`
-	Connections []Connection `json:"connections"`
+	ID             string       `json:"id"`
+	Name           string       `json:"name"`
+	DefaultProject string       `json:"defaultProject,omitempty"`
+	Steps          []StepView   `json:"steps"`
+	Connections    []Connection `json:"connections"`
 }
 
 type StepView struct {
@@ -82,9 +85,10 @@ type SourceView struct {
 }
 
 type workflowDef struct {
-	ID    string    `yaml:"id"`
-	Name  string    `yaml:"name"`
-	Steps []stepDef `yaml:"steps"`
+	ID             string    `yaml:"id"`
+	Name           string    `yaml:"name"`
+	DefaultProject string    `yaml:"defaultProject"`
+	Steps          []stepDef `yaml:"steps"`
 }
 
 type stepDef struct {
@@ -98,6 +102,7 @@ type stepDef struct {
 
 type inputDef struct {
 	Name   string     `yaml:"name"`
+	Value  string     `yaml:"value"`
 	Source *sourceDef `yaml:"source"`
 }
 
@@ -128,7 +133,14 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 	if err != nil {
 		return nil, err
 	}
-	project, err := filepath.Abs(req.ProjectPath)
+	projectPath := req.ProjectPath
+	if projectPath == "" {
+		projectPath = wf.DefaultProject
+	}
+	if projectPath == "" {
+		return nil, fmt.Errorf("project path required (no Workflow defaultProject)")
+	}
+	project, err := filepath.Abs(projectPath)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +175,7 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 		if mode == "" {
 			mode = "series"
 		}
-		env, err := resolveInputs(step, outputs)
+		env, err := resolveInputs(step, outputs, req.InputOverrides)
 		if err != nil {
 			run.Status = StatusFailed
 			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
@@ -172,7 +184,7 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 		_ = jl.Append(map[string]any{"type": "step_started", "stepId": step.ID, "mode": mode})
 		switch mode {
 		case "series":
-			if err := e.runSeries(project, step, env, jl); err != nil {
+			if err := e.runSeries(project, step, env, req.ArgumentOverrides, jl); err != nil {
 				run.Status = StatusFailed
 				_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
 				return run, nil
@@ -216,7 +228,7 @@ func (e *Engine) GetWorkflow(id string) (*Workflow, error) {
 }
 
 func toWorkflowView(wf *workflowDef) *Workflow {
-	out := &Workflow{ID: wf.ID, Name: wf.Name}
+	out := &Workflow{ID: wf.ID, Name: wf.Name, DefaultProject: wf.DefaultProject}
 	for _, s := range wf.Steps {
 		sv := StepView{ID: s.ID, Name: s.Name, Mode: s.Mode}
 		for _, in := range s.Inputs {
@@ -248,21 +260,29 @@ func toWorkflowView(wf *workflowDef) *Workflow {
 	return out
 }
 
-func resolveInputs(step stepDef, outputs map[string]map[string]string) ([]string, error) {
+func resolveInputs(step stepDef, outputs map[string]map[string]string, overrides map[string]string) ([]string, error) {
 	var env []string
 	for _, in := range step.Inputs {
-		if in.Source == nil {
+		key := step.ID + "." + in.Name
+		if ov, ok := overrides[key]; ok {
+			env = append(env, fmt.Sprintf("SUBSPACE_INPUT_%s=%s", in.Name, ov))
 			continue
 		}
-		stepOut, ok := outputs[in.Source.StepID]
-		if !ok {
-			return nil, fmt.Errorf("input %q: step %q has no outputs yet", in.Name, in.Source.StepID)
+		if in.Source != nil {
+			stepOut, ok := outputs[in.Source.StepID]
+			if !ok {
+				return nil, fmt.Errorf("input %q: step %q has no outputs yet", in.Name, in.Source.StepID)
+			}
+			val, ok := stepOut[in.Source.Output]
+			if !ok {
+				return nil, fmt.Errorf("input %q: output %q.%q not found", in.Name, in.Source.StepID, in.Source.Output)
+			}
+			env = append(env, fmt.Sprintf("SUBSPACE_INPUT_%s=%s", in.Name, val))
+			continue
 		}
-		val, ok := stepOut[in.Source.Output]
-		if !ok {
-			return nil, fmt.Errorf("input %q: output %q.%q not found", in.Name, in.Source.StepID, in.Source.Output)
+		if in.Value != "" {
+			env = append(env, fmt.Sprintf("SUBSPACE_INPUT_%s=%s", in.Name, in.Value))
 		}
-		env = append(env, fmt.Sprintf("SUBSPACE_INPUT_%s=%s", in.Name, val))
 	}
 	return env, nil
 }
@@ -283,16 +303,16 @@ func (e *Engine) loadWorkflow(id string) (*workflowDef, error) {
 	return &wf, nil
 }
 
-func (e *Engine) runSeries(project string, step stepDef, env []string, jl *jsonl) error {
+func (e *Engine) runSeries(project string, step stepDef, env []string, argOverrides map[string][]string, jl *jsonl) error {
 	for _, p := range step.Processes {
-		if err := e.runProcess(project, p, env, jl); err != nil {
+		if err := e.runProcess(project, p, env, argOverrides, jl); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (e *Engine) runProcess(project string, p processDef, env []string, jl *jsonl) error {
+func (e *Engine) runProcess(project string, p processDef, env []string, argOverrides map[string][]string, jl *jsonl) error {
 	_ = jl.Append(map[string]any{"type": "process_started", "processId": p.ID, "command": p.Command})
 
 	cwd := project
@@ -304,7 +324,11 @@ func (e *Engine) runProcess(project string, p processDef, env []string, jl *json
 		}
 	}
 
-	cmd := exec.Command(p.Command, p.Arguments...)
+	args := p.Arguments
+	if ov, ok := argOverrides[p.ID]; ok {
+		args = ov
+	}
+	cmd := exec.Command(p.Command, args...)
 	cmd.Dir = cwd
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
