@@ -23,13 +23,12 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/runs/{repo}", s.startRun)
 	mux.HandleFunc("GET /api/runs/{repo}", s.listRuns)
+	mux.HandleFunc("GET /api/runs/{repo}/{runId}/events", s.followRun)
+	mux.HandleFunc("POST /api/runs/{repo}/{runId}/pause", s.pauseRun)
+	mux.HandleFunc("POST /api/runs/{repo}/{runId}/resume", s.resumeRun)
+	mux.HandleFunc("POST /api/runs/{repo}/{runId}/stop", s.stopRun)
+	mux.HandleFunc("POST /api/runs/{repo}/{runId}/rewind", s.rewindRun)
 	mux.HandleFunc("GET /api/runs/{repo}/{runId}", s.getRun)
-	// ponytail: flat control routes until #20 nests debugger APIs
-	mux.HandleFunc("GET /api/runs/{id}/events", s.followRun)
-	mux.HandleFunc("POST /api/runs/{id}/pause", s.pauseRun)
-	mux.HandleFunc("POST /api/runs/{id}/resume", s.resumeRun)
-	mux.HandleFunc("POST /api/runs/{id}/stop", s.stopRun)
-	mux.HandleFunc("POST /api/runs/{id}/rewind", s.rewindRun)
 	mux.HandleFunc("GET /api/workflows/{repo}/{workflowId}", s.getWorkflow)
 	mux.HandleFunc("GET /api/workflows/{repo}", s.listWorkflows)
 	mux.HandleFunc("GET /api/repos", s.listRepos)
@@ -117,30 +116,46 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) pauseRun(w http.ResponseWriter, r *http.Request) {
-	if err := s.Eng.Pause(r.PathValue("id")); err != nil {
+	repo, id, ok := s.runPath(w, r)
+	if !ok {
+		return
+	}
+	if err := s.Eng.Pause(id); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.writeRun(w, r.PathValue("id"))
+	s.writeRunInRepo(w, repo, id)
 }
 
 func (s *Server) resumeRun(w http.ResponseWriter, r *http.Request) {
-	if err := s.Eng.Resume(r.PathValue("id")); err != nil {
+	repo, id, ok := s.runPath(w, r)
+	if !ok {
+		return
+	}
+	if err := s.Eng.Resume(id); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.writeRun(w, r.PathValue("id"))
+	s.writeRunInRepo(w, repo, id)
 }
 
 func (s *Server) stopRun(w http.ResponseWriter, r *http.Request) {
-	if err := s.Eng.Stop(r.PathValue("id")); err != nil {
+	repo, id, ok := s.runPath(w, r)
+	if !ok {
+		return
+	}
+	if err := s.Eng.Stop(id); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.writeRun(w, r.PathValue("id"))
+	s.writeRunInRepo(w, repo, id)
 }
 
 func (s *Server) rewindRun(w http.ResponseWriter, r *http.Request) {
+	repo, id, ok := s.runPath(w, r)
+	if !ok {
+		return
+	}
 	var body struct {
 		StepID string `json:"stepId"`
 	}
@@ -152,15 +167,32 @@ func (s *Server) rewindRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "stepId required", http.StatusBadRequest)
 		return
 	}
-	if err := s.Eng.Rewind(r.PathValue("id"), body.StepID); err != nil {
+	if err := s.Eng.Rewind(id, body.StepID); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.writeRun(w, r.PathValue("id"))
+	s.writeRunInRepo(w, repo, id)
 }
 
-func (s *Server) writeRun(w http.ResponseWriter, id string) {
-	run, err := s.Eng.Get(id)
+func (s *Server) runPath(w http.ResponseWriter, r *http.Request) (repo, id string, ok bool) {
+	repo = r.PathValue("repo")
+	id = r.PathValue("runId")
+	if repo == "" || id == "" {
+		http.Error(w, "missing repo or runId", http.StatusBadRequest)
+		return "", "", false
+	}
+	if !s.requireRepo(w, repo) {
+		return "", "", false
+	}
+	if _, err := s.Eng.GetInRepo(repo, id); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return "", "", false
+	}
+	return repo, id, true
+}
+
+func (s *Server) writeRunInRepo(w http.ResponseWriter, repo, id string) {
+	run, err := s.Eng.GetInRepo(repo, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -217,7 +249,10 @@ func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) followRun(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	_, id, ok := s.runPath(w, r)
+	if !ok {
+		return
+	}
 	ch, cancel, err := s.Eng.Follow(id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)

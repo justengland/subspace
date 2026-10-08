@@ -1,6 +1,53 @@
-import { useEffect, useState, type ReactNode } from "react";
-import { api, type Repo, type Workflow, type WorkflowRun } from "./api/client";
-import { Canvas } from "./canvas/Canvas";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  API_BASE,
+  api,
+  type Repo,
+  type TimelineEvent,
+  type Workflow,
+  type WorkflowRun,
+} from "./api/client";
+import { Canvas, type StepStatus } from "./canvas/Canvas";
+
+function wsURL(path: string) {
+  return `${API_BASE.replace(/^http/, "ws")}${path}`;
+}
+
+function deriveStepStatus(run: WorkflowRun | null, events: TimelineEvent[]): Record<string, StepStatus> {
+  const out: Record<string, StepStatus> = {};
+  for (const sr of run?.stepRuns ?? []) {
+    const s = sr.status.toLowerCase();
+    if (s === "running" || s === "started") out[sr.stepId] = "running";
+    else if (s === "succeeded" || s === "success") out[sr.stepId] = "succeeded";
+    else if (s === "failed" || s === "error") out[sr.stepId] = "failed";
+    else if (s === "stopped") out[sr.stepId] = "stopped";
+    else out[sr.stepId] = "idle";
+  }
+  for (const ev of events) {
+    const sid = ev.stepId;
+    if (!sid) continue;
+    if (ev.type === "step_started") out[sid] = "running";
+    else if (ev.type === "step_succeeded") out[sid] = "succeeded";
+    else if (ev.type === "step_failed") out[sid] = "failed";
+  }
+  if (run?.status === "failed" || run?.status === "stopped") {
+    for (const [id, st] of Object.entries(out)) {
+      if (st === "running") out[id] = run.status === "stopped" ? "stopped" : "failed";
+    }
+  }
+  return out;
+}
+
+function statusTone(status: string | undefined): string {
+  if (!status) return "idle";
+  const s = status.toLowerCase();
+  if (s === "running" || s === "started") return "running";
+  if (s === "succeeded" || s === "success") return "succeeded";
+  if (s === "failed" || s === "error") return "failed";
+  if (s === "stopped") return "stopped";
+  if (s === "paused") return "paused";
+  return "idle";
+}
 
 type Route =
   | { kind: "home" }
@@ -255,12 +302,19 @@ function WorkflowCanvas({ repo, workflowId }: { repo: string; workflowId: string
   );
 }
 
-function RunStatus({ repo, runId }: { repo: string; runId: string }) {
+function RunDebugger({ repo, runId }: { repo: string; runId: string }) {
   const [run, setRun] = useState<WorkflowRun | null>(null);
+  const [workflow, setWorkflow] = useState<Workflow | null>(null);
+  const [events, setEvents] = useState<TimelineEvent[]>([]);
+  const [timelineKey, setTimelineKey] = useState(0);
+  const [rewindStepId, setRewindStepId] = useState("");
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const stepStatus = useMemo(() => deriveStepStatus(run, events), [run, events]);
+
   useEffect(() => {
     let cancelled = false;
-    const tick = async () => {
+    void (async () => {
       const { data, error: err, response } = await api.GET("/api/runs/{repo}/{runId}", {
         params: { path: { repo, runId } },
       });
@@ -274,40 +328,211 @@ function RunStatus({ repo, runId }: { repo: string; runId: string }) {
         return;
       }
       setRun(data);
-    };
-    void tick();
-    const id = window.setInterval(() => void tick(), 500);
+      const wf = await api.GET("/api/workflows/{repo}/{workflowId}", {
+        params: { path: { repo, workflowId: data.workflowId } },
+      });
+      if (!cancelled && wf.data) setWorkflow(wf.data);
+    })();
     return () => {
       cancelled = true;
-      window.clearInterval(id);
     };
   }, [repo, runId]);
 
+  useEffect(() => {
+    if (!run?.id) return;
+    setEvents([]);
+    const path = `/api/runs/${encodeURIComponent(repo)}/${encodeURIComponent(run.id)}/events`;
+    const ws = new WebSocket(wsURL(path));
+    ws.onmessage = (msg) => {
+      const ev = JSON.parse(msg.data) as TimelineEvent;
+      setEvents((prev) => [...prev, ev]);
+      if (ev.type === "workflow_succeeded" || ev.type === "workflow_failed" || ev.type === "workflow_stopped") {
+        const status =
+          ev.type === "workflow_succeeded" ? "succeeded" : ev.type === "workflow_stopped" ? "stopped" : "failed";
+        setRun((r) => (r ? { ...r, status } : r));
+      }
+      if (ev.type === "workflow_paused") {
+        setRun((r) => (r ? { ...r, status: "paused" } : r));
+      }
+      if (ev.type === "step_started" && ev.stepId) {
+        setRun((r) => (r ? { ...r, cursorStepId: ev.stepId } : r));
+      }
+    };
+    ws.onerror = () => setError("WebSocket error");
+    return () => ws.close();
+  }, [repo, run?.id, timelineKey]);
+
+  async function control(action: "pause" | "resume" | "stop") {
+    setBusy(true);
+    setError("");
+    try {
+      const path =
+        action === "pause"
+          ? "/api/runs/{repo}/{runId}/pause"
+          : action === "resume"
+            ? "/api/runs/{repo}/{runId}/resume"
+            : "/api/runs/{repo}/{runId}/stop";
+      const { data, error: err } = await api.POST(path, {
+        params: { path: { repo, runId } },
+      });
+      if (err || !data) throw new Error(typeof err === "string" ? err : `${action} failed`);
+      setRun(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rewind() {
+    if (!rewindStepId.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      const { data, error: err } = await api.POST("/api/runs/{repo}/{runId}/rewind", {
+        params: { path: { repo, runId } },
+        body: { stepId: rewindStepId.trim() },
+      });
+      if (err || !data) throw new Error(typeof err === "string" ? err : "rewind failed");
+      setRun(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refresh() {
+    setBusy(true);
+    setError("");
+    try {
+      const { data, error: err } = await api.GET("/api/runs/{repo}/{runId}", {
+        params: { path: { repo, runId } },
+      });
+      if (err || !data) throw new Error(typeof err === "string" ? err : "getRun failed");
+      setRun(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const tone = statusTone(run?.status);
+
   return (
-    <Shell title={run ? `${run.status} · ${runId}` : runId}>
-      <p>
-        <Link href={`/workflows/${encodeURIComponent(repo)}`}>← {repo}</Link>
-        {run && (
-          <>
-            {" · "}
-            <Link
-              href={`/workflows/${encodeURIComponent(repo)}/${encodeURIComponent(run.workflowId)}`}
+    <div className="debugger">
+      <header className="debugger-header">
+        <div className="debugger-header-inner">
+          <h1 className="debugger-brand">
+            <Link href="/">Subspace</Link>
+          </h1>
+          <div className="debugger-meta">
+            <span className="debugger-status" data-tone={tone}>
+              {run?.status ?? "loading"}
+            </span>
+            <span className="debugger-run-id">{runId}</span>
+            <Link href={`/workflows/${encodeURIComponent(repo)}`}>{repo}</Link>
+            {run && (
+              <Link
+                href={`/workflows/${encodeURIComponent(repo)}/${encodeURIComponent(run.workflowId)}`}
+              >
+                {run.workflowId}
+              </Link>
+            )}
+          </div>
+          <div className="toolbar" role="toolbar" aria-label="WorkflowRun controls">
+            <button className="btn-pause" disabled={busy || !run} onClick={() => void control("pause")}>
+              Pause
+            </button>
+            <button className="btn-start" disabled={busy || !run} onClick={() => void control("resume")}>
+              Resume
+            </button>
+            <button className="btn-stop" disabled={busy || !run} onClick={() => void control("stop")}>
+              Stop
+            </button>
+            <button
+              className="btn-rewind"
+              disabled={busy || !run || !rewindStepId.trim()}
+              onClick={() => void rewind()}
             >
-              {run.workflowId}
-            </Link>
-          </>
-        )}
-      </p>
-      {error && <p className="debugger-error">{error}</p>}
-      {run && (
-        <div>
-          <p>
-            WorkflowRun <code>{run.id}</code> · status <strong>{run.status}</strong>
-          </p>
-          <p className="muted">Debugger controls land in a later ticket.</p>
+              Rewind
+            </button>
+            <button disabled={busy || !run} onClick={() => void refresh()}>
+              Refresh
+            </button>
+            <button
+              disabled={!run}
+              onClick={() => {
+                setEvents([]);
+                setTimelineKey((k) => k + 1);
+              }}
+            >
+              Reconnect
+            </button>
+          </div>
         </div>
-      )}
-    </Shell>
+      </header>
+
+      <div className="debugger-body">
+        {error && <p className="debugger-error">{error}</p>}
+        <div className="debugger-split">
+          <div className="debugger-canvas">
+            {workflow ? (
+              <div className="wf-canvas">
+                <Canvas
+                  steps={workflow.steps}
+                  connections={workflow.connections}
+                  stepStatus={stepStatus}
+                  cursorStepId={run?.cursorStepId}
+                  onSelectStep={setRewindStepId}
+                />
+              </div>
+            ) : (
+              <div className="canvas-empty">Loading Workflow canvas…</div>
+            )}
+          </div>
+          <aside className="debugger-panel">
+            <section className="panel-section">
+              <h2>Rewind</h2>
+              <label className="field">
+                Step ID (click a canvas Step)
+                <span className="inline-row">
+                  <input value={rewindStepId} onChange={(e) => setRewindStepId(e.target.value)} />
+                  <button
+                    className="panel-btn danger"
+                    disabled={busy || !run || !rewindStepId.trim()}
+                    onClick={() => void rewind()}
+                  >
+                    Rewind
+                  </button>
+                </span>
+              </label>
+            </section>
+            <section className="panel-section">
+              <h2>Timeline</h2>
+              {events.length === 0 ? (
+                <p className="muted">Timeline events appear when the WebSocket connects.</p>
+              ) : (
+                <ol className="timeline-list">
+                  {events.map((ev, i) => (
+                    <li key={i}>
+                      <span className="timeline-type">{ev.type}</span>
+                      {ev.stepId != null && <span> {ev.stepId}</span>}
+                      {typeof ev.iteration === "number" && ev.iteration > 0 && (
+                        <span> iter={String(ev.iteration)}</span>
+                      )}
+                      {ev.data != null && <span> {ev.data}</span>}
+                      {ev.processId != null && ev.data == null && <span> {ev.processId}</span>}
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </section>
+          </aside>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -321,7 +546,7 @@ export default function App() {
     case "workflow":
       return <WorkflowCanvas repo={route.repo} workflowId={route.workflowId} />;
     case "run":
-      return <RunStatus repo={route.repo} runId={route.runId} />;
+      return <RunDebugger repo={route.repo} runId={route.runId} />;
     default:
       return (
         <Shell title="Not found">

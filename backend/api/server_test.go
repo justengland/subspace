@@ -107,8 +107,7 @@ steps:
 	var run engine.WorkflowRun
 	_ = json.NewDecoder(res.Body).Decode(&run)
 
-	// ponytail: events stay flat until #20
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/api/runs/" + run.ID + "/events"
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/api/runs/demo/" + run.ID + "/events"
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		t.Fatal(err)

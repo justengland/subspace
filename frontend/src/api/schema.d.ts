@@ -100,7 +100,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs/{id}/pause": {
+    "/api/runs/{repo}/{runId}/pause": {
         parameters: {
             query?: never;
             header?: never;
@@ -116,7 +116,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs/{id}/resume": {
+    "/api/runs/{repo}/{runId}/resume": {
         parameters: {
             query?: never;
             header?: never;
@@ -132,7 +132,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs/{id}/stop": {
+    "/api/runs/{repo}/{runId}/stop": {
         parameters: {
             query?: never;
             header?: never;
@@ -148,7 +148,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs/{id}/rewind": {
+    "/api/runs/{repo}/{runId}/rewind": {
         parameters: {
             query?: never;
             header?: never;
@@ -164,7 +164,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs/{id}/events": {
+    "/api/runs/{repo}/{runId}/events": {
         parameters: {
             query?: never;
             header?: never;
@@ -298,7 +298,8 @@ export interface components {
     parameters: {
         /** @description Registered Repo name */
         RepoName: string;
-        Id: string;
+        /** @description WorkflowRun id */
+        RunId: string;
     };
     requestBodies: never;
     headers: never;
@@ -460,7 +461,8 @@ export interface operations {
             path: {
                 /** @description Registered Repo name */
                 repo: components["parameters"]["RepoName"];
-                runId: string;
+                /** @description WorkflowRun id */
+                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
@@ -483,7 +485,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["Id"];
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                /** @description WorkflowRun id */
+                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
@@ -499,6 +504,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["TextError"];
+            404: components["responses"]["TextError"];
         };
     };
     resumeRun: {
@@ -506,7 +512,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["Id"];
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                /** @description WorkflowRun id */
+                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
@@ -522,6 +531,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["TextError"];
+            404: components["responses"]["TextError"];
         };
     };
     stopRun: {
@@ -529,7 +539,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["Id"];
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                /** @description WorkflowRun id */
+                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
@@ -545,6 +558,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["TextError"];
+            404: components["responses"]["TextError"];
         };
     };
     rewindRun: {
@@ -552,7 +566,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["Id"];
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                /** @description WorkflowRun id */
+                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
@@ -572,6 +589,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["TextError"];
+            404: components["responses"]["TextError"];
         };
     };
     followRunEvents: {
@@ -579,7 +597,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["Id"];
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                /** @description WorkflowRun id */
+                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
