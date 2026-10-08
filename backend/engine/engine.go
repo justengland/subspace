@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -17,6 +19,7 @@ const (
 	StatusSucceeded = "succeeded"
 	StatusFailed    = "failed"
 	StatusRunning   = "running"
+	StatusStopped   = "stopped"
 )
 
 type Config struct {
@@ -35,11 +38,18 @@ type StartRequest struct {
 	ProjectPath string `json:"projectPath"`
 }
 
+type ProcessRun struct {
+	ProcessID string `json:"processId"`
+	Status    string `json:"status"`
+	ExitCode  int    `json:"exitCode,omitempty"`
+}
+
 type WorkflowRun struct {
-	ID          string `json:"id"`
-	WorkflowID  string `json:"workflowId"`
-	ProjectPath string `json:"projectPath"`
-	Status      string `json:"status"`
+	ID          string       `json:"id"`
+	WorkflowID  string       `json:"workflowId"`
+	ProjectPath string       `json:"projectPath"`
+	Status      string       `json:"status"`
+	ProcessRuns []ProcessRun `json:"processRuns,omitempty"`
 }
 
 type workflowDef struct {
@@ -105,17 +115,18 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 			mode = "series"
 		}
 		_ = jl.Append(map[string]any{"type": "step_started", "stepId": step.ID, "mode": mode})
+		var stepErr error
 		switch mode {
 		case "series":
-			if err := e.runSeries(project, step, jl); err != nil {
-				run.Status = StatusFailed
-				_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
-				return run, nil
-			}
+			stepErr = e.runSeries(run, project, step, jl)
+		case "parallel":
+			stepErr = e.runParallel(run, project, step, jl)
 		default:
-			err := fmt.Errorf("unsupported mode %q", mode)
+			stepErr = fmt.Errorf("unsupported mode %q", mode)
+		}
+		if stepErr != nil {
 			run.Status = StatusFailed
-			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
+			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": stepErr.Error()})
 			return run, nil
 		}
 		_ = jl.Append(map[string]any{"type": "step_succeeded", "stepId": step.ID})
@@ -134,6 +145,7 @@ func (e *Engine) Get(id string) (*WorkflowRun, error) {
 		return nil, fmt.Errorf("WorkflowRun %q not found", id)
 	}
 	cp := *run
+	cp.ProcessRuns = append([]ProcessRun(nil), run.ProcessRuns...)
 	return &cp, nil
 }
 
@@ -153,16 +165,85 @@ func (e *Engine) loadWorkflow(id string) (*workflowDef, error) {
 	return &wf, nil
 }
 
-func (e *Engine) runSeries(project string, step stepDef, jl *jsonl) error {
+func (e *Engine) runSeries(run *WorkflowRun, project string, step stepDef, jl *jsonl) error {
 	for _, p := range step.Processes {
-		if err := e.runProcess(project, p, jl); err != nil {
+		pr, err := e.runProcess(project, p, jl, nil)
+		run.ProcessRuns = append(run.ProcessRuns, pr)
+		if err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (e *Engine) runProcess(project string, p processDef, jl *jsonl) error {
+func (e *Engine) runParallel(run *WorkflowRun, project string, step stepDef, jl *jsonl) error {
+	type slot struct {
+		def  processDef
+		cmd  *exec.Cmd
+		term atomic.Bool
+		pr   ProcessRun
+	}
+	slots := make([]*slot, len(step.Processes))
+	for i, p := range step.Processes {
+		cmd, err := e.startCmd(project, p, jl)
+		if err != nil {
+			return err
+		}
+		slots[i] = &slot{def: p, cmd: cmd}
+	}
+
+	var failOnce sync.Once
+	var firstErr error
+	var mu sync.Mutex
+	sigtermSiblings := func(failed *slot) {
+		failOnce.Do(func() {
+			for _, s := range slots {
+				if s == failed || s.cmd.Process == nil {
+					continue
+				}
+				s.term.Store(true)
+				_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGTERM)
+				_ = jl.Append(map[string]any{"type": "process_sigterm", "processId": s.def.ID})
+			}
+		})
+	}
+
+	var wg sync.WaitGroup
+	for _, s := range slots {
+		wg.Add(1)
+		go func(s *slot) {
+			defer wg.Done()
+			pr, err := e.waitCmd(s.def, s.cmd, jl, &s.term)
+			mu.Lock()
+			s.pr = pr
+			if err != nil && pr.Status != StatusStopped {
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				sigtermSiblings(s)
+				return
+			}
+			mu.Unlock()
+		}(s)
+	}
+	wg.Wait()
+
+	for _, s := range slots {
+		run.ProcessRuns = append(run.ProcessRuns, s.pr)
+	}
+	return firstErr
+}
+
+func (e *Engine) runProcess(project string, p processDef, jl *jsonl, termFlag *atomic.Bool) (ProcessRun, error) {
+	cmd, err := e.startCmd(project, p, jl)
+	if err != nil {
+		return ProcessRun{ProcessID: p.ID, Status: StatusFailed}, err
+	}
+	return e.waitCmd(p, cmd, jl, termFlag)
+}
+
+func (e *Engine) startCmd(project string, p processDef, jl *jsonl) (*exec.Cmd, error) {
 	_ = jl.Append(map[string]any{"type": "process_started", "processId": p.ID, "command": p.Command})
 
 	cwd := project
@@ -176,41 +257,47 @@ func (e *Engine) runProcess(project string, p processDef, jl *jsonl) error {
 
 	cmd := exec.Command(p.Command, p.Arguments...)
 	cmd.Dir = cwd
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
-		return err
+		return nil, err
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); pipeLines(jl, "stdout", p.ID, stdout) }()
-	go func() { defer wg.Done(); pipeLines(jl, "stderr", p.ID, stderr) }()
-	wg.Wait()
+	go pipeLines(jl, "stdout", p.ID, stdout)
+	go pipeLines(jl, "stderr", p.ID, stderr)
+	return cmd, nil
+}
 
-	err = cmd.Wait()
+func (e *Engine) waitCmd(p processDef, cmd *exec.Cmd, jl *jsonl, termFlag *atomic.Bool) (ProcessRun, error) {
+	err := cmd.Wait()
 	exit := 0
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			exit = ee.ExitCode()
 		} else {
 			_ = jl.Append(map[string]any{"type": "process_failed", "processId": p.ID, "error": err.Error()})
-			return err
+			return ProcessRun{ProcessID: p.ID, Status: StatusFailed}, err
 		}
+	}
+
+	if termFlag != nil && termFlag.Load() {
+		_ = jl.Append(map[string]any{"type": "process_stopped", "processId": p.ID, "exitCode": exit})
+		return ProcessRun{ProcessID: p.ID, Status: StatusStopped, ExitCode: exit}, fmt.Errorf("process %s stopped", p.ID)
 	}
 	if exit != 0 {
 		_ = jl.Append(map[string]any{"type": "process_failed", "processId": p.ID, "exitCode": exit})
-		return fmt.Errorf("process %s exited %d", p.ID, exit)
+		return ProcessRun{ProcessID: p.ID, Status: StatusFailed, ExitCode: exit}, fmt.Errorf("process %s exited %d", p.ID, exit)
 	}
 	_ = jl.Append(map[string]any{"type": "process_succeeded", "processId": p.ID, "exitCode": 0})
-	return nil
+	return ProcessRun{ProcessID: p.ID, Status: StatusSucceeded, ExitCode: 0}, nil
 }
 
 func pipeLines(jl *jsonl, stream, processID string, r io.Reader) {

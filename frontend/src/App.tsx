@@ -2,11 +2,18 @@ import { useState } from "react";
 
 const API = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
 
+type ProcessRun = {
+  processId: string;
+  status: string;
+  exitCode?: number;
+};
+
 type WorkflowRun = {
   id: string;
   workflowId: string;
   projectPath: string;
   status: string;
+  processRuns?: ProcessRun[];
 };
 
 export default function App() {

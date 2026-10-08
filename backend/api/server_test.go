@@ -59,3 +59,54 @@ steps:
 		t.Fatalf("get=%+v", got)
 	}
 }
+
+func TestHTTPParallelFailShowsProcessRuns(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	_ = os.MkdirAll(project, 0o755)
+	_ = os.MkdirAll(workflows, 0o755)
+	_ = os.WriteFile(filepath.Join(project, "long.sh"), []byte("#!/bin/sh\ntrap 'exit 143' TERM\nsleep 30\n"), 0o755)
+	_ = os.WriteFile(filepath.Join(project, "fail.sh"), []byte("#!/bin/sh\nsleep 0.2\nexit 1\n"), 0o755)
+	_ = os.WriteFile(filepath.Join(workflows, "pf.yaml"), []byte(`
+id: pf
+steps:
+  - id: s
+    mode: parallel
+    processes:
+      - id: long
+        command: ./long.sh
+      - id: fail
+        command: ./fail.sh
+`), 0o644)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	h := (&api.Server{Eng: eng}).Handler()
+
+	body, _ := json.Marshal(map[string]string{"workflowId": "pf", "projectPath": project})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/runs", bytes.NewReader(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("start status %d: %s", rr.Code, rr.Body)
+	}
+	var run engine.WorkflowRun
+	if err := json.Unmarshal(rr.Body.Bytes(), &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != engine.StatusFailed {
+		t.Fatalf("status=%s want failed", run.Status)
+	}
+	if len(run.ProcessRuns) < 2 {
+		t.Fatalf("processRuns=%d body=%s", len(run.ProcessRuns), rr.Body)
+	}
+	foundFail := false
+	for _, pr := range run.ProcessRuns {
+		if pr.ProcessID == "fail" && pr.Status == engine.StatusFailed {
+			foundFail = true
+		}
+	}
+	if !foundFail {
+		t.Fatalf("missing failed ProcessRun: %+v", run.ProcessRuns)
+	}
+}
