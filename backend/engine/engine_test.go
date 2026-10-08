@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/justengland/subspace/backend/engine"
 )
@@ -52,17 +53,11 @@ steps:
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if run.Status != engine.StatusSucceeded {
-		t.Fatalf("status=%s want succeeded", run.Status)
+	if run.Status != engine.StatusRunning {
+		t.Fatalf("status=%s want running", run.Status)
 	}
 
-	got, err := eng.Get(run.ID)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if got.Status != engine.StatusSucceeded {
-		t.Fatalf("Get status=%s", got.Status)
-	}
+	_ = waitStatus(t, eng, run.ID, engine.StatusSucceeded)
 
 	if _, err := os.Stat(filepath.Join(project, "a.done")); err != nil {
 		t.Fatalf("a.sh did not run: %v", err)
@@ -99,6 +94,26 @@ steps:
 	if !strings.Contains(string(data), "a-out") || !strings.Contains(string(data), "b-out") {
 		t.Fatalf("JSONL missing stdout chunks: %s", data)
 	}
+}
+
+func waitStatus(t *testing.T, eng *engine.Engine, id, want string) *engine.WorkflowRun {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err := eng.Get(id)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got.Status == want {
+			return got
+		}
+		if got.Status != engine.StatusRunning {
+			t.Fatalf("status=%s want %s", got.Status, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for %s", want)
+	return nil
 }
 
 func mustMkdir(t *testing.T, p string) {
