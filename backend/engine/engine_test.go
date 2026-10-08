@@ -6,9 +6,128 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/justengland/subspace/backend/engine"
 )
+
+func TestPauseHoldsThenResumeContinues(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(project, "slow1.sh"), `#!/bin/sh
+touch "$PWD/s1.started"
+sleep 2
+touch "$PWD/s1.done"
+`)
+	writeFile(t, filepath.Join(project, "step2.sh"), `#!/bin/sh
+touch "$PWD/s2.done"
+`)
+	chmodX(t, filepath.Join(project, "slow1.sh"))
+	chmodX(t, filepath.Join(project, "step2.sh"))
+
+	writeFile(t, filepath.Join(workflows, "two-step.yaml"), `
+id: two-step
+steps:
+  - id: one
+    mode: series
+    processes:
+      - id: p1
+        command: ./slow1.sh
+  - id: two
+    mode: series
+    processes:
+      - id: p2
+        command: ./step2.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{WorkflowID: "two-step", ProjectPath: project})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if run.Status != engine.StatusRunning {
+		t.Fatalf("Start status=%s want running", run.Status)
+	}
+
+	waitFile(t, filepath.Join(project, "s1.started"), 3*time.Second)
+	if err := eng.Pause(run.ID); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	waitStatus(t, eng, run.ID, engine.StatusPaused, 5*time.Second)
+	if _, err := os.Stat(filepath.Join(project, "s1.done")); err != nil {
+		t.Fatalf("Pause should let in-flight ProcessRun finish: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(project, "s2.done")); err == nil {
+		t.Fatal("step two ran before Resume")
+	}
+
+	if err := eng.Resume(run.ID); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	waitStatus(t, eng, run.ID, engine.StatusSucceeded, 5*time.Second)
+	if _, err := os.Stat(filepath.Join(project, "s2.done")); err != nil {
+		t.Fatalf("step two did not run after Resume: %v", err)
+	}
+}
+
+func TestStopSIGTERMsAndEndsScheduling(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(project, "trap.sh"), `#!/bin/sh
+trap 'touch "$PWD/termed"; exit 0' TERM
+touch "$PWD/started"
+sleep 30
+touch "$PWD/should-not"
+`)
+	writeFile(t, filepath.Join(project, "next.sh"), `#!/bin/sh
+touch "$PWD/next.done"
+`)
+	chmodX(t, filepath.Join(project, "trap.sh"))
+	chmodX(t, filepath.Join(project, "next.sh"))
+
+	writeFile(t, filepath.Join(workflows, "stop-me.yaml"), `
+id: stop-me
+steps:
+  - id: one
+    mode: series
+    processes:
+      - id: long
+        command: ./trap.sh
+  - id: two
+    mode: series
+    processes:
+      - id: next
+        command: ./next.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{WorkflowID: "stop-me", ProjectPath: project})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitFile(t, filepath.Join(project, "started"), 3*time.Second)
+	if err := eng.Stop(run.ID); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	waitStatus(t, eng, run.ID, engine.StatusStopped, 5*time.Second)
+	waitFile(t, filepath.Join(project, "termed"), 2*time.Second)
+	if _, err := os.Stat(filepath.Join(project, "should-not")); err == nil {
+		t.Fatal("process continued after SIGTERM")
+	}
+	if _, err := os.Stat(filepath.Join(project, "next.done")); err == nil {
+		t.Fatal("next Step scheduled after Stop")
+	}
+}
 
 func TestSeriesWorkflowSucceeds(t *testing.T) {
 	root := t.TempDir()
@@ -52,9 +171,10 @@ steps:
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if run.Status != engine.StatusSucceeded {
-		t.Fatalf("status=%s want succeeded", run.Status)
+	if run.Status != engine.StatusRunning {
+		t.Fatalf("status=%s want running", run.Status)
 	}
+	waitStatus(t, eng, run.ID, engine.StatusSucceeded, 5*time.Second)
 
 	got, err := eng.Get(run.ID)
 	if err != nil {
@@ -99,6 +219,36 @@ steps:
 	if !strings.Contains(string(data), "a-out") || !strings.Contains(string(data), "b-out") {
 		t.Fatalf("JSONL missing stdout chunks: %s", data)
 	}
+}
+
+func waitFile(t *testing.T, path string, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for %s", path)
+}
+
+func waitStatus(t *testing.T, eng *engine.Engine, id, want string, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	var last string
+	for time.Now().Before(deadline) {
+		got, err := eng.Get(id)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		last = got.Status
+		if got.Status == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting status=%s got=%s", want, last)
 }
 
 func mustMkdir(t *testing.T, p string) {
