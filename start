@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Launch frontend (top-right) + backend (bottom-right); agent stays left.
+# Must be run from a single-pane Herdr tab.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+FRONT_PORT="${SUBSPACE_FRONT_PORT:-4200}"
+ADDR="${SUBSPACE_ADDR:-:4201}"
+API_URL="${VITE_API_URL:-http://localhost:${ADDR#:}}"
+
+warn() { printf 'warning: %s\n' "$*" >&2; }
+
+if [[ "${HERDR_ENV:-}" != "1" ]]; then
+  warn "not in a Herdr pane (HERDR_ENV!=1); aborting"
+  exit 1
+fi
+
+if [[ -z "${HERDR_WORKSPACE_ID:-}" || -z "${HERDR_TAB_ID:-}" || -z "${HERDR_PANE_ID:-}" ]]; then
+  warn "missing HERDR_WORKSPACE_ID / HERDR_TAB_ID / HERDR_PANE_ID; aborting"
+  exit 1
+fi
+
+if ! command -v herdr >/dev/null || ! command -v jq >/dev/null; then
+  warn "need herdr and jq on PATH; aborting"
+  exit 1
+fi
+
+pane_count="$(
+  herdr pane list --workspace "$HERDR_WORKSPACE_ID" \
+    | jq --arg t "$HERDR_TAB_ID" '[.result.panes[] | select(.tab_id == $t)] | length'
+)"
+if [[ "$pane_count" != "1" ]]; then
+  warn "not a single-pane Herdr tab (found ${pane_count} panes in this tab); aborting"
+  exit 1
+fi
+
+agent_pane="$HERDR_PANE_ID"
+
+# Right column: frontend on top, backend below. Agent stays left.
+front_json="$(herdr pane split --pane "$agent_pane" --direction right --cwd "$ROOT" --no-focus)"
+front_pane="$(printf '%s\n' "$front_json" | jq -r '.result.pane.pane_id')"
+back_json="$(herdr pane split --pane "$front_pane" --direction down --cwd "$ROOT" --no-focus)"
+back_pane="$(printf '%s\n' "$back_json" | jq -r '.result.pane.pane_id')"
+
+herdr pane rename "$front_pane" frontend >/dev/null
+herdr pane rename "$back_pane" backend >/dev/null
+
+# No `exec`: if the server exits, the shell (and pane) stay so the error is visible.
+herdr pane run "$front_pane" \
+  "cd $(printf '%q' "$ROOT/frontend") && (test -d node_modules || npm install) && env VITE_API_URL=$(printf '%q' "$API_URL") npm run dev -- --host 127.0.0.1 --port $(printf '%q' "$FRONT_PORT")"
+
+herdr pane run "$back_pane" \
+  "cd $(printf '%q' "$ROOT/backend") && go run ./cmd/subspace -addr $(printf '%q' "$ADDR") -workflows $(printf '%q' "$ROOT/workflows")"
+
+printf 'frontend → pane %s (http://127.0.0.1:%s/)\n' "$front_pane" "$FRONT_PORT"
+printf 'backend  → pane %s (%s)\n' "$back_pane" "$API_URL"

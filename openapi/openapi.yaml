@@ -6,7 +6,7 @@ info:
     HTTP control plane for WorkflowRuns. Live timeline events use WebSocket at
     GET /api/runs/{id}/events (see TimelineEvent); not a generated HTTP call.
 servers:
-  - url: http://localhost:8080
+  - url: http://localhost:4201
 paths:
   /api/health:
     get:

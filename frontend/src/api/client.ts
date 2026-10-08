@@ -8,6 +8,6 @@ export type Connection = components["schemas"]["Connection"];
 export type TimelineEvent = components["schemas"]["TimelineEvent"];
 export type StartRequest = components["schemas"]["StartRequest"];
 
-export const API_BASE = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
+export const API_BASE = import.meta.env.VITE_API_URL ?? "http://localhost:4201";
 
 export const api = createClient<paths>({ baseUrl: API_BASE });

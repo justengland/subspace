@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":8080", "HTTP listen address")
+	addr := flag.String("addr", ":4201", "HTTP listen address")
 	workflows := flag.String("workflows", "", "workflows directory (default: SUBSPACE_HOME/workflows or ./workflows)")
 	storage := flag.String("storage", "", "run storage root (default: ~/.local/subspace)")
 	flag.Parse()
