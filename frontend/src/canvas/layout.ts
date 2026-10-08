@@ -1,5 +1,5 @@
-/** Optional stored Visualization position (never written by UI in phase 1). */
-export type VizPos = { x: number; y: number };
+/** Optional stored Visualization (never written by UI in phase 1). */
+export type VizPos = { position?: { x: number; y: number } };
 
 export type LayoutNode = {
   id: string;
@@ -25,8 +25,8 @@ export function layoutSteps(
   steps: { id: string; name: string; visualization?: VizPos }[],
 ): LayoutNode[] {
   return steps.map((s, i) => {
-    const x = s.visualization?.x ?? ORIGIN_X + i * (NODE_W + GAP_X);
-    const y = s.visualization?.y ?? ORIGIN_Y + (i % 2) * (NODE_H + GAP_Y);
+    const x = s.visualization?.position?.x ?? ORIGIN_X + i * (NODE_W + GAP_X);
+    const y = s.visualization?.position?.y ?? ORIGIN_Y + (i % 2) * (NODE_H + GAP_Y);
     return { id: s.id, label: s.name || s.id, x, y, w: NODE_W, h: NODE_H };
   });
 }

@@ -65,8 +65,9 @@ type ProcessRun struct {
 }
 
 type StepRun struct {
-	StepID string `json:"stepId"`
-	Status string `json:"status"`
+	StepID    string `json:"stepId"`
+	Status    string `json:"status"`
+	Iteration int    `json:"iteration,omitempty"`
 }
 
 type WorkflowRun struct {
@@ -97,11 +98,22 @@ type Workflow struct {
 }
 
 type StepView struct {
-	ID      string       `json:"id"`
-	Name    string       `json:"name"`
-	Mode    string       `json:"mode"`
-	Inputs  []InputView  `json:"inputs,omitempty"`
-	Outputs []OutputView `json:"outputs,omitempty"`
+	ID            string         `json:"id"`
+	Name          string         `json:"name"`
+	Mode          string         `json:"mode"`
+	Inputs        []InputView    `json:"inputs,omitempty"`
+	Outputs       []OutputView   `json:"outputs,omitempty"`
+	Visualization *Visualization `json:"visualization,omitempty"`
+}
+
+// Visualization is optional layout metadata (never affects execution).
+type Visualization struct {
+	Position *VizPosition `json:"position,omitempty"`
+}
+
+type VizPosition struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
 }
 
 type InputView struct {
@@ -135,6 +147,16 @@ type stepDef struct {
 	Inputs        []inputDef    `yaml:"inputs"`
 	Outputs       []outputDef   `yaml:"outputs"`
 	Processes     []processDef  `yaml:"processes"`
+	Visualization *vizDef       `yaml:"visualization"`
+}
+
+type vizDef struct {
+	Position *vizPosDef `yaml:"position"`
+}
+
+type vizPosDef struct {
+	X float64 `yaml:"x"`
+	Y float64 `yaml:"y"`
 }
 
 type inputDef struct {
@@ -245,7 +267,7 @@ func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req Start
 	jl := rec.jl
 	run := rec.run
 
-	_ = jl.Append(map[string]any{"type": "workflow_started", "workflowId": wf.ID, "runId": run.ID})
+	_ = jl.Append(map[string]any{"type": "workflow_started", "workflowId": wf.ID, "runId": run.ID, "projectPath": project})
 
 	outputs := map[string]map[string]string{}
 	loopIters := map[string]int{}
@@ -293,9 +315,8 @@ func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req Start
 			}
 			if iteration > max {
 				err := fmt.Errorf("loop step %q: maxIterations %d exceeded", step.ID, max)
-				rec.setStatus(StatusFailed)
 				_ = jl.Append(map[string]any{"type": "step_started", "stepId": step.ID, "mode": mode, "iteration": iteration})
-				_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
+				failStep(rec, jl, step.ID, iteration, err)
 				return
 			}
 		}
@@ -329,8 +350,7 @@ func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req Start
 				_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": run.ID})
 				return
 			}
-			rec.setStatus(StatusFailed)
-			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": stepErr.Error()})
+			failStep(rec, jl, step.ID, iteration, stepErr)
 			return
 		}
 		stepOut := map[string]string{}
@@ -338,8 +358,12 @@ func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req Start
 			stepOut[o.Name] = o.Value
 		}
 		outputs[step.ID] = stepOut
-		_ = jl.Append(map[string]any{"type": "step_succeeded", "stepId": step.ID})
-		rec.appendStepRun(StepRun{StepID: step.ID, Status: StatusSucceeded})
+		sev := map[string]any{"type": "step_succeeded", "stepId": step.ID}
+		if iteration > 0 {
+			sev["iteration"] = iteration
+		}
+		_ = jl.Append(sev)
+		rec.appendStepRun(StepRun{StepID: step.ID, Status: StatusSucceeded, Iteration: iteration})
 		i += delta
 		if i < len(wf.Steps) {
 			rec.setCursor(wf.Steps[i].ID)
@@ -365,22 +389,22 @@ func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req Start
 
 func (e *Engine) Get(id string) (*WorkflowRun, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	rec, ok := e.runs[id]
-	if !ok {
-		return nil, fmt.Errorf("WorkflowRun %q not found", id)
+	e.mu.Unlock()
+	if ok {
+		rec.mu.Lock()
+		cp := *rec.run
+		cp.ProcessRuns = append([]ProcessRun(nil), rec.run.ProcessRuns...)
+		cp.StepRuns = append([]StepRun(nil), rec.run.StepRuns...)
+		rec.mu.Unlock()
+		return &cp, nil
 	}
-	rec.mu.Lock()
-	cp := *rec.run
-	cp.ProcessRuns = append([]ProcessRun(nil), rec.run.ProcessRuns...)
-	cp.StepRuns = append([]StepRun(nil), rec.run.StepRuns...)
-	rec.mu.Unlock()
-	return &cp, nil
+	run, _, err := e.loadFromDisk(id)
+	return run, err
 }
 
-// List returns in-memory WorkflowRuns, newest id first.
+// List returns WorkflowRuns from memory and StorageRoot, newest id first.
 // Optional projectPath filters by absolute Project path.
-// ponytail: in-memory only; scan StorageRoot if history across restarts is needed.
 func (e *Engine) List(projectPath string) ([]WorkflowRun, error) {
 	var abs string
 	if projectPath != "" {
@@ -390,9 +414,10 @@ func (e *Engine) List(projectPath string) ([]WorkflowRun, error) {
 			return nil, err
 		}
 	}
+	seen := map[string]struct{}{}
+	var out []WorkflowRun
+
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	out := make([]WorkflowRun, 0, len(e.runs))
 	for _, rec := range e.runs {
 		rec.mu.Lock()
 		if abs == "" || rec.run.ProjectPath == abs {
@@ -400,9 +425,17 @@ func (e *Engine) List(projectPath string) ([]WorkflowRun, error) {
 			cp.ProcessRuns = append([]ProcessRun(nil), rec.run.ProcessRuns...)
 			cp.StepRuns = append([]StepRun(nil), rec.run.StepRuns...)
 			out = append(out, cp)
+			seen[cp.ID] = struct{}{}
 		}
 		rec.mu.Unlock()
 	}
+	e.mu.Unlock()
+
+	disk, err := e.scanStorage(abs, seen)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, disk...)
 	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
 	return out, nil
 }
@@ -613,19 +646,38 @@ func sigterm(cmd *exec.Cmd) {
 }
 
 // Follow sends JSONL history then live appends (same map shape as the file).
-// The channel closes when the run finishes (or immediately after history if already done).
+// Cold (disk-only) runs stream history then close.
 func (e *Engine) Follow(id string) (<-chan map[string]any, func(), error) {
 	e.mu.Lock()
 	rec, ok := e.runs[id]
 	e.mu.Unlock()
-	if !ok {
-		return nil, nil, fmt.Errorf("WorkflowRun %q not found", id)
-	}
 
 	out := make(chan map[string]any, 256)
 	stop := make(chan struct{})
 	var once sync.Once
 	cancel := func() { once.Do(func() { close(stop) }) }
+
+	if !ok {
+		_, path, err := e.loadFromDisk(id)
+		if err != nil {
+			return nil, nil, err
+		}
+		hist, err := readJSONLFile(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		go func() {
+			defer close(out)
+			for _, ev := range hist {
+				select {
+				case out <- ev:
+				case <-stop:
+					return
+				}
+			}
+		}()
+		return out, cancel, nil
+	}
 
 	go func() {
 		defer close(out)
@@ -669,6 +721,11 @@ func toWorkflowView(wf *workflowDef) *Workflow {
 	out := &Workflow{ID: wf.ID, Name: wf.Name, DefaultProject: wf.DefaultProject}
 	for _, s := range wf.Steps {
 		sv := StepView{ID: s.ID, Name: s.Name, Mode: s.Mode}
+		if s.Visualization != nil && s.Visualization.Position != nil {
+			sv.Visualization = &Visualization{
+				Position: &VizPosition{X: s.Visualization.Position.X, Y: s.Visualization.Position.Y},
+			}
+		}
 		for _, in := range s.Inputs {
 			iv := InputView{Name: in.Name}
 			if in.Source != nil {
@@ -873,10 +930,10 @@ func (e *Engine) runLoop(rec *runRec, project string, step stepDef, inputs map[s
 		if idx == 0 {
 			return 0, fmt.Errorf("loop step %q: no previous step", step.ID)
 		}
-		_ = jl.Append(map[string]any{"type": "loop_branch", "stepId": step.ID, "direction": "previous"})
+		_ = jl.Append(map[string]any{"type": "loop_continue", "stepId": step.ID, "direction": "previous"})
 		return -1, nil
 	}
-	_ = jl.Append(map[string]any{"type": "loop_branch", "stepId": step.ID, "direction": "next"})
+	_ = jl.Append(map[string]any{"type": "loop_continue", "stepId": step.ID, "direction": "next"})
 	return 1, nil
 }
 
@@ -1017,4 +1074,141 @@ func pipeLines(jl *jsonl, stream, processID string, r io.Reader) {
 func shortID() string {
 	now := time.Now().UTC()
 	return fmt.Sprintf("%s-%04x", now.Format("20060102-150405"), now.Nanosecond()&0xffff)
+}
+
+func failStep(rec *runRec, jl *jsonl, stepID string, iteration int, err error) {
+	sr := StepRun{StepID: stepID, Status: StatusFailed, Iteration: iteration}
+	rec.appendStepRun(sr)
+	ev := map[string]any{"type": "step_failed", "stepId": stepID, "error": err.Error()}
+	if iteration > 0 {
+		ev["iteration"] = iteration
+	}
+	_ = jl.Append(ev)
+	rec.setStatus(StatusFailed)
+	_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
+}
+
+func (e *Engine) scanStorage(absProject string, skip map[string]struct{}) ([]WorkflowRun, error) {
+	if e.cfg.StorageRoot == "" {
+		return nil, nil
+	}
+	var out []WorkflowRun
+	err := filepath.WalkDir(e.cfg.StorageRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || d.Name() != "events.jsonl" {
+			return nil
+		}
+		runID := filepath.Base(filepath.Dir(path))
+		if _, ok := skip[runID]; ok {
+			return nil
+		}
+		events, err := readJSONLFile(path)
+		if err != nil || len(events) == 0 {
+			return nil
+		}
+		run := reconstructRun(events)
+		if run.ID == "" {
+			run.ID = runID
+		}
+		if absProject != "" && run.ProjectPath != absProject {
+			return nil
+		}
+		out = append(out, *run)
+		return nil
+	})
+	return out, err
+}
+
+func (e *Engine) loadFromDisk(id string) (*WorkflowRun, string, error) {
+	if e.cfg.StorageRoot == "" {
+		return nil, "", fmt.Errorf("WorkflowRun %q not found", id)
+	}
+	var found string
+	_ = filepath.WalkDir(e.cfg.StorageRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		if d.Name() == "events.jsonl" && filepath.Base(filepath.Dir(path)) == id {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if found == "" {
+		return nil, "", fmt.Errorf("WorkflowRun %q not found", id)
+	}
+	events, err := readJSONLFile(found)
+	if err != nil {
+		return nil, "", err
+	}
+	run := reconstructRun(events)
+	if run.ID == "" {
+		run.ID = id
+	}
+	return run, found, nil
+}
+
+func reconstructRun(events []map[string]any) *WorkflowRun {
+	run := &WorkflowRun{Status: StatusRunning}
+	for _, ev := range events {
+		typ, _ := ev["type"].(string)
+		switch typ {
+		case "workflow_started":
+			run.ID = eventStr(ev, "runId")
+			run.WorkflowID = eventStr(ev, "workflowId")
+			run.ProjectPath = eventStr(ev, "projectPath")
+			run.Status = StatusRunning
+		case "step_started":
+			run.CursorStepID = eventStr(ev, "stepId")
+		case "step_succeeded":
+			run.StepRuns = append(run.StepRuns, StepRun{
+				StepID: eventStr(ev, "stepId"), Status: StatusSucceeded, Iteration: eventInt(ev, "iteration"),
+			})
+		case "step_failed":
+			run.StepRuns = append(run.StepRuns, StepRun{
+				StepID: eventStr(ev, "stepId"), Status: StatusFailed, Iteration: eventInt(ev, "iteration"),
+			})
+		case "process_succeeded":
+			run.ProcessRuns = append(run.ProcessRuns, ProcessRun{
+				ProcessID: eventStr(ev, "processId"), Status: StatusSucceeded, ExitCode: eventInt(ev, "exitCode"),
+			})
+		case "process_failed":
+			run.ProcessRuns = append(run.ProcessRuns, ProcessRun{
+				ProcessID: eventStr(ev, "processId"), Status: StatusFailed, ExitCode: eventInt(ev, "exitCode"),
+			})
+		case "process_stopped":
+			run.ProcessRuns = append(run.ProcessRuns, ProcessRun{
+				ProcessID: eventStr(ev, "processId"), Status: StatusStopped, ExitCode: eventInt(ev, "exitCode"),
+			})
+		case "workflow_succeeded":
+			run.Status = StatusSucceeded
+		case "workflow_failed":
+			run.Status = StatusFailed
+		case "workflow_stopped":
+			run.Status = StatusStopped
+		case "workflow_paused":
+			run.Status = StatusPaused
+		}
+	}
+	return run
+}
+
+func eventStr(ev map[string]any, key string) string {
+	if v, ok := ev[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func eventInt(ev map[string]any, key string) int {
+	switch v := ev[key].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	default:
+		return 0
+	}
 }

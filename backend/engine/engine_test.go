@@ -1095,3 +1095,274 @@ steps:
 		t.Fatalf("log=%q want 3 loop iterations then cap", log)
 	}
 }
+
+func TestListScansStorageRootAcrossRestart(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+	writeFile(t, filepath.Join(project, "ok.sh"), "#!/bin/sh\necho ok\n")
+	chmodX(t, filepath.Join(project, "ok.sh"))
+	writeFile(t, filepath.Join(workflows, "one.yaml"), `
+id: one
+steps:
+  - id: s
+    mode: series
+    processes:
+      - id: p
+        command: ./ok.sh
+`)
+
+	eng1 := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng1.Start(engine.StartRequest{WorkflowID: "one", ProjectPath: project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = waitStatus(t, eng1, run.ID, engine.StatusSucceeded)
+
+	// Simulate daemon restart: fresh Engine, same StorageRoot.
+	eng2 := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	listed, err := eng2.List(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != run.ID {
+		t.Fatalf("List after restart=%+v want id %s", listed, run.ID)
+	}
+	if listed[0].Status != engine.StatusSucceeded || listed[0].WorkflowID != "one" {
+		t.Fatalf("listed=%+v", listed[0])
+	}
+
+	got, err := eng2.Get(run.ID)
+	if err != nil {
+		t.Fatalf("Get cold: %v", err)
+	}
+	if got.Status != engine.StatusSucceeded || len(got.StepRuns) == 0 {
+		t.Fatalf("Get cold=%+v", got)
+	}
+
+	ch, cancel, err := eng2.Follow(run.ID)
+	if err != nil {
+		t.Fatalf("Follow cold: %v", err)
+	}
+	defer cancel()
+	var types []string
+	for ev := range ch {
+		types = append(types, ev["type"].(string))
+	}
+	joined := strings.Join(types, ",")
+	if !strings.Contains(joined, "workflow_started") || !strings.Contains(joined, "workflow_succeeded") {
+		t.Fatalf("Follow cold events=%v", types)
+	}
+}
+
+func TestStepRunRecordsLoopIteration(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+	writeFile(t, filepath.Join(project, "a.sh"), "#!/bin/sh\necho a >> \"$PWD/log\"\n")
+	writeFile(t, filepath.Join(project, "loop.sh"), "#!/bin/sh\necho loop >> \"$PWD/log\"\n")
+	writeFile(t, filepath.Join(project, "b.sh"), "#!/bin/sh\necho b >> \"$PWD/log\"\n")
+	chmodX(t, filepath.Join(project, "a.sh"))
+	chmodX(t, filepath.Join(project, "loop.sh"))
+	chmodX(t, filepath.Join(project, "b.sh"))
+	writeFile(t, filepath.Join(workflows, "loop.yaml"), `
+id: loop
+steps:
+  - id: before
+    mode: series
+    outputs:
+      - name: cont
+        value: no
+    processes:
+      - id: run-a
+        command: ./a.sh
+  - id: bounce
+    mode: loop
+    inputs:
+      - name: cont
+        source:
+          stepId: before
+          output: cont
+    when:
+      eq:
+        input: cont
+        value: yes
+    processes:
+      - id: run-loop
+        command: ./loop.sh
+  - id: after
+    mode: series
+    processes:
+      - id: run-b
+        command: ./b.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{WorkflowID: "loop", ProjectPath: project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run = waitStatus(t, eng, run.ID, engine.StatusSucceeded)
+	var bounce *engine.StepRun
+	for i := range run.StepRuns {
+		if run.StepRuns[i].StepID == "bounce" {
+			bounce = &run.StepRuns[i]
+			break
+		}
+	}
+	if bounce == nil {
+		t.Fatalf("no bounce StepRun in %+v", run.StepRuns)
+	}
+	if bounce.Iteration != 1 {
+		t.Fatalf("bounce iteration=%d want 1", bounce.Iteration)
+	}
+}
+
+func TestProcessFailureAppendsFailedStepRun(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+	writeFile(t, filepath.Join(project, "fail.sh"), "#!/bin/sh\nexit 1\n")
+	chmodX(t, filepath.Join(project, "fail.sh"))
+	writeFile(t, filepath.Join(workflows, "fail.yaml"), `
+id: fail
+steps:
+  - id: boom
+    mode: series
+    processes:
+      - id: p
+        command: ./fail.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{WorkflowID: "fail", ProjectPath: project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run = waitStatus(t, eng, run.ID, engine.StatusFailed)
+	if len(run.StepRuns) != 1 || run.StepRuns[0].StepID != "boom" || run.StepRuns[0].Status != engine.StatusFailed {
+		t.Fatalf("StepRuns=%+v want failed boom", run.StepRuns)
+	}
+	raw, err := os.ReadFile(filepath.Join(storage, "proj", run.ID, "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"type":"step_failed"`) {
+		t.Fatalf("jsonl missing step_failed: %s", raw)
+	}
+}
+
+func TestMaxIterationsAppendsFailedStepRun(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+	writeFile(t, filepath.Join(project, "a.sh"), "#!/bin/sh\necho a >> \"$PWD/log\"\n")
+	writeFile(t, filepath.Join(project, "loop.sh"), "#!/bin/sh\necho loop >> \"$PWD/log\"\n")
+	chmodX(t, filepath.Join(project, "a.sh"))
+	chmodX(t, filepath.Join(project, "loop.sh"))
+	writeFile(t, filepath.Join(workflows, "loop.yaml"), `
+id: loop
+steps:
+  - id: before
+    mode: series
+    outputs:
+      - name: cont
+        value: yes
+    processes:
+      - id: run-a
+        command: ./a.sh
+  - id: bounce
+    mode: loop
+    maxIterations: 1
+    inputs:
+      - name: cont
+        source:
+          stepId: before
+          output: cont
+    when:
+      eq:
+        input: cont
+        value: yes
+    processes:
+      - id: run-loop
+        command: ./loop.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{WorkflowID: "loop", ProjectPath: project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run = waitStatus(t, eng, run.ID, engine.StatusFailed)
+	var failed *engine.StepRun
+	for i := range run.StepRuns {
+		if run.StepRuns[i].Status == engine.StatusFailed {
+			failed = &run.StepRuns[i]
+			break
+		}
+	}
+	if failed == nil || failed.StepID != "bounce" {
+		t.Fatalf("StepRuns=%+v want failed bounce", run.StepRuns)
+	}
+	if failed.Iteration != 2 {
+		t.Fatalf("failed iteration=%d want 2 (exceeded max 1)", failed.Iteration)
+	}
+	raw, _ := os.ReadFile(filepath.Join(storage, "proj", run.ID, "events.jsonl"))
+	if !strings.Contains(string(raw), `"type":"step_failed"`) {
+		t.Fatalf("jsonl missing step_failed: %s", raw)
+	}
+}
+
+func TestGetWorkflowLoadsVisualization(t *testing.T) {
+	root := t.TempDir()
+	workflows := filepath.Join(root, "workflows")
+	mustMkdir(t, workflows)
+	writeFile(t, filepath.Join(workflows, "viz.yaml"), `
+id: viz
+name: Viz
+steps:
+  - id: a
+    name: A
+    mode: series
+    visualization:
+      position:
+        x: 100
+        y: 200
+    processes:
+      - id: p
+        command: true
+  - id: b
+    name: B
+    mode: series
+    processes:
+      - id: p2
+        command: true
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: filepath.Join(root, "storage")})
+	wf, err := eng.GetWorkflow("viz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wf.Steps[0].Visualization == nil || wf.Steps[0].Visualization.Position == nil {
+		t.Fatalf("step a missing visualization: %+v", wf.Steps[0])
+	}
+	if wf.Steps[0].Visualization.Position.X != 100 || wf.Steps[0].Visualization.Position.Y != 200 {
+		t.Fatalf("viz=%+v", wf.Steps[0].Visualization)
+	}
+	if wf.Steps[1].Visualization != nil {
+		t.Fatalf("step b should have no visualization")
+	}
+}

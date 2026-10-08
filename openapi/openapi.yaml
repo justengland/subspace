@@ -45,10 +45,10 @@ paths:
           required: false
           schema:
             type: string
-          description: Absolute or relative Project path; empty lists all in-memory runs
+          description: Absolute or relative Project path; empty lists all runs under StorageRoot
       responses:
         "200":
-          description: In-memory WorkflowRuns (newest id first)
+          description: WorkflowRuns from memory + StorageRoot (newest id first)
           content:
             application/json:
               schema:
@@ -237,6 +237,9 @@ components:
           type: string
         status:
           type: string
+        iteration:
+          type: integer
+          description: Loop iteration when relevant (0 omitted)
     ProcessRun:
       type: object
       required: [processId, status]
@@ -285,6 +288,21 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/OutputView"
+        visualization:
+          $ref: "#/components/schemas/Visualization"
+    Visualization:
+      type: object
+      properties:
+        position:
+          $ref: "#/components/schemas/VizPosition"
+    VizPosition:
+      type: object
+      required: [x, y]
+      properties:
+        x:
+          type: number
+        y:
+          type: number
     InputView:
       type: object
       required: [name]

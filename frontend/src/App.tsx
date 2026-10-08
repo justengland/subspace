@@ -73,6 +73,7 @@ export default function App() {
   const [rewindStepId, setRewindStepId] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [history, setHistory] = useState<WorkflowRun[]>([]);
 
   const stepStatus = useMemo(() => deriveStepStatus(run, events), [run, events]);
 
@@ -165,6 +166,32 @@ export default function App() {
     if (!run) return;
     setEvents([]);
     setTimelineKey((k) => k + 1);
+  }
+
+  async function loadHistory() {
+    setBusy(true);
+    setError("");
+    try {
+      const { data, error: err } = await api.GET("/api/runs", {
+        params: { query: projectPath ? { projectPath } : {} },
+      });
+      if (err || !data) throw new Error(typeof err === "string" ? err : "listRuns failed");
+      setHistory(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function reopen(past: WorkflowRun) {
+    setEvents([]);
+    setRun(past);
+    setTimelineKey((k) => k + 1);
+    if (past.workflowId && past.workflowId !== workflow?.id) {
+      setWorkflowId(past.workflowId);
+      await loadWorkflow(past.workflowId);
+    }
   }
 
   async function control(action: "pause" | "resume" | "stop") {
@@ -267,7 +294,27 @@ export default function App() {
         <button disabled={!run} onClick={reconnect}>
           Reconnect timeline
         </button>
+        <button disabled={busy} onClick={loadHistory}>
+          List runs
+        </button>
       </div>
+      {history.length > 0 && (
+        <section style={{ marginTop: 12 }}>
+          <h2 style={{ fontSize: "1rem" }}>Run history</h2>
+          <ul style={{ listStyle: "none", padding: 0, margin: 0, fontFamily: "ui-monospace, monospace", fontSize: 13 }}>
+            {history.map((h) => (
+              <li key={h.id} style={{ borderBottom: "1px solid #ddd", padding: "4px 0", display: "flex", gap: 8, alignItems: "center" }}>
+                <button disabled={busy} onClick={() => reopen(h)} style={{ fontSize: 12 }}>
+                  Open
+                </button>
+                <span>
+                  {h.id} · {h.workflowId} · {h.status}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
       <label style={{ display: "block", marginTop: 8 }}>
         Rewind to Step ID (click a canvas Step to fill)
         <span style={{ display: "flex", gap: 8, marginTop: 4 }}>
@@ -286,6 +333,7 @@ export default function App() {
               <li key={i} style={{ borderBottom: "1px solid #ddd", padding: "4px 0" }}>
                 <span style={{ color: "#666" }}>{ev.type}</span>
                 {ev.stepId != null && <span> {ev.stepId}</span>}
+                {typeof ev.iteration === "number" && ev.iteration > 0 && <span> iter={String(ev.iteration)}</span>}
                 {ev.data != null && <span> {ev.data}</span>}
                 {ev.processId != null && ev.data == null && <span> {ev.processId}</span>}
               </li>

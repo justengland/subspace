@@ -184,6 +184,8 @@ export interface components {
         StepRun: {
             stepId: string;
             status: string;
+            /** @description Loop iteration when relevant (0 omitted) */
+            iteration?: number;
         };
         ProcessRun: {
             processId: string;
@@ -204,6 +206,14 @@ export interface components {
             mode: string;
             inputs?: components["schemas"]["InputView"][];
             outputs?: components["schemas"]["OutputView"][];
+            visualization?: components["schemas"]["Visualization"];
+        };
+        Visualization: {
+            position?: components["schemas"]["VizPosition"];
+        };
+        VizPosition: {
+            x: number;
+            y: number;
         };
         InputView: {
             name: string;

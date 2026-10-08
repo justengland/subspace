@@ -1,5 +1,5 @@
 id: decision
-name: Decision Branch
+name: Decision
 steps:
   - id: set-kind
     name: Set Kind
@@ -11,9 +11,13 @@ steps:
       - id: noop
         name: Noop
         command: true
-  - id: branch
-    name: Branch
+  - id: decide
+    name: Decision
     mode: decision
+    visualization:
+      position:
+        x: 220
+        y: 40
     inputs:
       - name: kind
         source:
@@ -27,7 +31,7 @@ steps:
             input: kind
             value: csv
         command: sh
-        arguments: ["-c", "echo csv-branch"]
+        arguments: ["-c", "echo csv"]
       - id: handle-json
         name: Handle JSON
         when:
@@ -35,11 +39,11 @@ steps:
             input: kind
             values: [json, ndjson]
         command: sh
-        arguments: ["-c", "echo json-branch"]
+        arguments: ["-c", "echo json"]
       - id: handle-tagged
         name: Handle Tagged
         when:
           exists:
             input: tag
         command: sh
-        arguments: ["-c", "echo tagged-branch"]
+        arguments: ["-c", "echo tagged"]

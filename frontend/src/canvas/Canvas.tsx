@@ -1,9 +1,7 @@
 import type { Connection, StepView } from "../api/client";
-import { layoutSteps, type VizPos } from "./layout";
+import { layoutSteps } from "./layout";
 
 export type StepStatus = "idle" | "running" | "succeeded" | "failed" | "stopped";
-
-type StepWithViz = StepView & { visualization?: VizPos };
 
 const STATUS_FILL: Record<StepStatus, string> = {
   idle: "#e8e8e8",
@@ -14,7 +12,7 @@ const STATUS_FILL: Record<StepStatus, string> = {
 };
 
 type Props = {
-  steps: StepWithViz[];
+  steps: StepView[];
   connections: Connection[];
   stepStatus: Record<string, StepStatus>;
   cursorStepId?: string;
