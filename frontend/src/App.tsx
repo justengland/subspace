@@ -35,16 +35,27 @@ function wsURL(path: string) {
   return `${base}${path}`;
 }
 
+/** Map Engine/API status strings to UI tone (header chip + Step canvas). */
+function statusTone(status: string | undefined): StepStatus | "paused" {
+  if (!status) return "idle";
+  const s = status.toLowerCase();
+  if (s === "running" || s === "started") return "running";
+  if (s === "succeeded" || s === "success") return "succeeded";
+  if (s === "failed" || s === "error") return "failed";
+  if (s === "stopped") return "stopped";
+  if (s === "paused") return "paused";
+  return "idle";
+}
+
+function asStepStatus(tone: StepStatus | "paused"): StepStatus {
+  return tone === "paused" ? "idle" : tone;
+}
+
 /** Derive Step status from timeline + WorkflowRun.stepRuns (UI never writes YAML). */
 function deriveStepStatus(run: WorkflowRun | null, events: TimelineEvent[]): Record<string, StepStatus> {
   const out: Record<string, StepStatus> = {};
   for (const sr of run?.stepRuns ?? []) {
-    const s = sr.status.toLowerCase();
-    if (s === "running" || s === "started") out[sr.stepId] = "running";
-    else if (s === "succeeded" || s === "success") out[sr.stepId] = "succeeded";
-    else if (s === "failed" || s === "error") out[sr.stepId] = "failed";
-    else if (s === "stopped") out[sr.stepId] = "stopped";
-    else out[sr.stepId] = "idle";
+    out[sr.stepId] = asStepStatus(statusTone(sr.status));
   }
   for (const ev of events) {
     const sid = ev.stepId;
@@ -59,17 +70,6 @@ function deriveStepStatus(run: WorkflowRun | null, events: TimelineEvent[]): Rec
     }
   }
   return out;
-}
-
-function statusTone(status: string | undefined): string {
-  if (!status) return "idle";
-  const s = status.toLowerCase();
-  if (s === "running" || s === "started") return "running";
-  if (s === "succeeded" || s === "success") return "succeeded";
-  if (s === "failed" || s === "error") return "failed";
-  if (s === "stopped") return "stopped";
-  if (s === "paused") return "paused";
-  return "idle";
 }
 
 export default function App() {
@@ -265,7 +265,7 @@ export default function App() {
           </div>
           <div className="toolbar" role="toolbar" aria-label="WorkflowRun controls">
             <button className="btn-accent" disabled={busy} onClick={() => loadWorkflow()}>
-              Load
+              Load canvas
             </button>
             <button className="btn-start" disabled={busy} onClick={start}>
               Start
@@ -290,10 +290,10 @@ export default function App() {
               Refresh
             </button>
             <button disabled={!run} onClick={reconnect}>
-              Reconnect
+              Reconnect timeline
             </button>
             <button disabled={busy} onClick={loadHistory}>
-              History
+              List runs
             </button>
           </div>
         </div>
@@ -370,9 +370,9 @@ export default function App() {
             </section>
 
             <section className="panel-section">
-              <h2>Run history</h2>
+              <h2>WorkflowRun history</h2>
               {history.length === 0 ? (
-                <p className="muted">No runs listed yet. Use History in the toolbar.</p>
+                <p className="muted">No WorkflowRuns listed yet. Use List runs in the toolbar.</p>
               ) : (
                 <ul className="history-list">
                   {history.map((h) => (

@@ -1,0 +1,5 @@
+# Copy to start.local (gitignored) for this worktree's ports.
+# Defaults in start remain 4200/4201 when start.local is absent.
+SUBSPACE_FRONT_PORT=4300
+SUBSPACE_ADDR=:4301
+export VITE_API_URL=http://localhost:4301

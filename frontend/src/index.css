@@ -13,7 +13,6 @@
   --color-ink: #f2f2f5;
   --color-muted: #9a9aad;
   --color-accent: #ea4b3a;
-  --color-node-jev: #3d8bfd;
   --color-edge: #6b6b7b;
   --color-success: #2bb673;
   --color-warn: #f0a202;
@@ -138,16 +137,16 @@ textarea {
 }
 
 .debugger-status[data-tone="running"] {
-  color: var(--color-node-jev);
-  border-color: color-mix(in srgb, var(--color-node-jev) 40%, var(--color-border));
+  color: var(--color-accent);
+  border-color: color-mix(in srgb, var(--color-accent) 40%, var(--color-border));
 }
 .debugger-status[data-tone="succeeded"] {
   color: var(--color-success);
 }
-.debugger-status[data-tone="failed"],
-.debugger-status[data-tone="stopped"] {
+.debugger-status[data-tone="failed"] {
   color: var(--color-danger);
 }
+.debugger-status[data-tone="stopped"],
 .debugger-status[data-tone="paused"] {
   color: var(--color-warn);
 }
@@ -225,7 +224,7 @@ textarea {
 
 .debugger-split {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+  grid-template-columns: minmax(480px, 1fr) minmax(320px, 360px);
   grid-template-rows: minmax(0, 1fr);
   gap: 1rem;
   flex: 1;

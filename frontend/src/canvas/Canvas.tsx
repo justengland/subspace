@@ -5,7 +5,7 @@ export type StepStatus = "idle" | "running" | "succeeded" | "failed" | "stopped"
 
 const STATUS_FILL: Record<StepStatus, string> = {
   idle: "var(--color-panel-2)",
-  running: "color-mix(in srgb, var(--color-node-jev) 35%, var(--color-panel))",
+  running: "color-mix(in srgb, var(--color-accent) 35%, var(--color-panel))",
   succeeded: "color-mix(in srgb, var(--color-success) 28%, var(--color-panel))",
   failed: "color-mix(in srgb, var(--color-danger) 28%, var(--color-panel))",
   stopped: "color-mix(in srgb, var(--color-warn) 28%, var(--color-panel))",
