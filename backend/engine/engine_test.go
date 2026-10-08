@@ -19,7 +19,6 @@ func TestSeriesWorkflowSucceeds(t *testing.T) {
 	mustMkdir(t, project)
 	mustMkdir(t, workflows)
 
-	// Project scripts: series must run a then b (marker proves order).
 	writeFile(t, filepath.Join(project, "a.sh"), "#!/bin/sh\necho a-out\ntouch \"$PWD/a.done\"\n")
 	writeFile(t, filepath.Join(project, "b.sh"), "#!/bin/sh\ntest -f \"$PWD/a.done\" || exit 1\necho b-out\ntouch \"$PWD/b.done\"\n")
 	chmodX(t, filepath.Join(project, "a.sh"))
@@ -93,6 +92,94 @@ steps:
 	}
 	if !strings.Contains(string(data), "a-out") || !strings.Contains(string(data), "b-out") {
 		t.Fatalf("JSONL missing stdout chunks: %s", data)
+	}
+}
+
+func TestInputSourceResolvesAcrossSteps(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(project, "check.sh"), `#!/bin/sh
+test "$SUBSPACE_INPUT_msg" = "hello-from-upstream" || { echo "got=$SUBSPACE_INPUT_msg" >&2; exit 1; }
+echo ok
+`)
+	chmodX(t, filepath.Join(project, "check.sh"))
+
+	writeFile(t, filepath.Join(workflows, "pipe.yaml"), `
+id: pipe
+steps:
+  - id: produce
+    mode: series
+    outputs:
+      - name: msg
+        value: hello-from-upstream
+    processes:
+      - id: noop
+        command: true
+  - id: consume
+    mode: series
+    inputs:
+      - name: msg
+        source:
+          stepId: produce
+          output: msg
+    processes:
+      - id: check
+        command: ./check.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{WorkflowID: "pipe", ProjectPath: project})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if run.Status != engine.StatusRunning {
+		t.Fatalf("status=%s want running", run.Status)
+	}
+	_ = waitStatus(t, eng, run.ID, engine.StatusSucceeded)
+}
+
+func TestConnectionsDerivedFromInputSource(t *testing.T) {
+	root := t.TempDir()
+	workflows := filepath.Join(root, "workflows")
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(workflows, "pipe.yaml"), `
+id: pipe
+steps:
+  - id: produce
+    outputs:
+      - name: msg
+        value: hello
+    processes:
+      - id: noop
+        command: true
+  - id: consume
+    inputs:
+      - name: msg
+        source:
+          stepId: produce
+          output: msg
+    processes:
+      - id: check
+        command: true
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: filepath.Join(root, "storage")})
+	wf, err := eng.GetWorkflow("pipe")
+	if err != nil {
+		t.Fatalf("GetWorkflow: %v", err)
+	}
+	if len(wf.Connections) != 1 {
+		t.Fatalf("connections=%d want 1: %+v", len(wf.Connections), wf.Connections)
+	}
+	c := wf.Connections[0]
+	if c.SourceStepID != "produce" || c.SourceOutput != "msg" || c.TargetStepID != "consume" || c.TargetInput != "msg" {
+		t.Fatalf("connection=%+v", c)
 	}
 }
 

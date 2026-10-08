@@ -21,6 +21,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/runs", s.startRun)
 	mux.HandleFunc("GET /api/runs/{id}/events", s.followRun)
 	mux.HandleFunc("GET /api/runs/{id}", s.getRun)
+	mux.HandleFunc("GET /api/workflows/{id}", s.getWorkflow)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -53,6 +54,20 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, run)
+}
+
+func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	wf, err := s.Eng.GetWorkflow(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, wf)
 }
 
 func (s *Server) followRun(w http.ResponseWriter, r *http.Request) {
