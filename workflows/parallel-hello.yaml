@@ -1,0 +1,13 @@
+id: parallel-hello
+name: Parallel Hello
+steps:
+  - id: both
+    name: Both
+    mode: parallel
+    processes:
+      - id: run-p1
+        name: Run P1
+        command: ./p1.sh
+      - id: run-p2
+        name: Run P2
+        command: ./p2.sh

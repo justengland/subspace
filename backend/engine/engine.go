@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -43,21 +44,28 @@ type runRec struct {
 	pauseReq bool
 	stopped  bool
 	resumeCh chan struct{}
-	cmd      *exec.Cmd
+	cmds     []*exec.Cmd
 }
 
 type StartRequest struct {
-	WorkflowID         string              `json:"workflowId"`
-	ProjectPath        string              `json:"projectPath,omitempty"` // empty → Workflow.defaultProject
-	InputOverrides     map[string]string   `json:"inputOverrides,omitempty"`     // "stepId.inputName" → value
-	ArgumentOverrides  map[string][]string `json:"argumentOverrides,omitempty"`  // processId → args
+	WorkflowID        string              `json:"workflowId"`
+	ProjectPath       string              `json:"projectPath,omitempty"`      // empty → Workflow.defaultProject
+	InputOverrides    map[string]string   `json:"inputOverrides,omitempty"`   // "stepId.inputName" → value
+	ArgumentOverrides map[string][]string `json:"argumentOverrides,omitempty"` // processId → args
+}
+
+type ProcessRun struct {
+	ProcessID string `json:"processId"`
+	Status    string `json:"status"`
+	ExitCode  int    `json:"exitCode,omitempty"`
 }
 
 type WorkflowRun struct {
-	ID          string `json:"id"`
-	WorkflowID  string `json:"workflowId"`
-	ProjectPath string `json:"projectPath"`
-	Status      string `json:"status"`
+	ID          string       `json:"id"`
+	WorkflowID  string       `json:"workflowId"`
+	ProjectPath string       `json:"projectPath"`
+	Status      string       `json:"status"`
+	ProcessRuns []ProcessRun `json:"processRuns,omitempty"`
 }
 
 // Connection is a derived edge from Input.source (not stored in YAML).
@@ -108,12 +116,14 @@ type workflowDef struct {
 }
 
 type stepDef struct {
-	ID        string       `yaml:"id"`
-	Name      string       `yaml:"name"`
-	Mode      string       `yaml:"mode"`
-	Inputs    []inputDef   `yaml:"inputs"`
-	Outputs   []outputDef  `yaml:"outputs"`
-	Processes []processDef `yaml:"processes"`
+	ID            string        `yaml:"id"`
+	Name          string        `yaml:"name"`
+	Mode          string        `yaml:"mode"`
+	MaxIterations *int          `yaml:"maxIterations"`
+	When          *predicateDef `yaml:"when"`
+	Inputs        []inputDef    `yaml:"inputs"`
+	Outputs       []outputDef   `yaml:"outputs"`
+	Processes     []processDef  `yaml:"processes"`
 }
 
 type inputDef struct {
@@ -220,8 +230,9 @@ func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req Start
 	_ = jl.Append(map[string]any{"type": "workflow_started", "workflowId": wf.ID, "runId": run.ID})
 
 	outputs := map[string]map[string]string{}
+	loopIters := map[string]int{}
 
-	for _, step := range wf.Steps {
+	for i := 0; i < len(wf.Steps); {
 		if rec.isStopped() {
 			rec.setStatus(StatusStopped)
 			_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": run.ID})
@@ -233,6 +244,7 @@ func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req Start
 			return
 		}
 
+		step := wf.Steps[i]
 		mode := step.Mode
 		if mode == "" {
 			mode = "series"
@@ -243,23 +255,55 @@ func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req Start
 			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
 			return
 		}
-		_ = jl.Append(map[string]any{"type": "step_started", "stepId": step.ID, "mode": mode})
+
+		iteration := 0
+		if mode == "loop" {
+			loopIters[step.ID]++
+			iteration = loopIters[step.ID]
+			max := 3
+			if step.MaxIterations != nil {
+				max = *step.MaxIterations
+			}
+			if iteration > max {
+				err := fmt.Errorf("loop step %q: maxIterations %d exceeded", step.ID, max)
+				rec.setStatus(StatusFailed)
+				_ = jl.Append(map[string]any{"type": "step_started", "stepId": step.ID, "mode": mode, "iteration": iteration})
+				_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
+				return
+			}
+		}
+
+		ev := map[string]any{"type": "step_started", "stepId": step.ID, "mode": mode}
+		if iteration > 0 {
+			ev["iteration"] = iteration
+		}
+		_ = jl.Append(ev)
+
+		var delta int
+		var stepErr error
 		switch mode {
 		case "series":
-			err = e.runSeries(rec, project, step, env, req.ArgumentOverrides, jl)
+			stepErr = e.runSeries(rec, project, step, env, req.ArgumentOverrides, jl)
+			delta = 1
+		case "parallel":
+			stepErr = e.runParallel(rec, project, step, env, req.ArgumentOverrides, jl)
+			delta = 1
 		case "decision":
-			err = e.runDecision(rec, project, step, inputs, env, req.ArgumentOverrides, jl)
+			stepErr = e.runDecision(rec, project, step, inputs, env, req.ArgumentOverrides, jl)
+			delta = 1
+		case "loop":
+			delta, stepErr = e.runLoop(rec, project, step, inputs, env, req.ArgumentOverrides, jl, i)
 		default:
-			err = fmt.Errorf("unsupported mode %q", mode)
+			stepErr = fmt.Errorf("unsupported mode %q", mode)
 		}
-		if err != nil {
+		if stepErr != nil {
 			if rec.isStopped() {
 				rec.setStatus(StatusStopped)
 				_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": run.ID})
 				return
 			}
 			rec.setStatus(StatusFailed)
-			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
+			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": stepErr.Error()})
 			return
 		}
 		stepOut := map[string]string{}
@@ -268,6 +312,7 @@ func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req Start
 		}
 		outputs[step.ID] = stepOut
 		_ = jl.Append(map[string]any{"type": "step_succeeded", "stepId": step.ID})
+		i += delta
 
 		if err := rec.waitIfPaused(); err != nil {
 			rec.setStatus(StatusStopped)
@@ -289,6 +334,7 @@ func (e *Engine) Get(id string) (*WorkflowRun, error) {
 	}
 	rec.mu.Lock()
 	cp := *rec.run
+	cp.ProcessRuns = append([]ProcessRun(nil), rec.run.ProcessRuns...)
 	rec.mu.Unlock()
 	return &cp, nil
 }
@@ -334,7 +380,7 @@ func (e *Engine) Stop(id string) error {
 	rec.mu.Lock()
 	rec.stopped = true
 	rec.pauseReq = false
-	cmd := rec.cmd
+	cmds := append([]*exec.Cmd(nil), rec.cmds...)
 	if rec.run.Status == StatusPaused {
 		select {
 		case rec.resumeCh <- struct{}{}:
@@ -342,7 +388,9 @@ func (e *Engine) Stop(id string) error {
 		}
 	}
 	rec.mu.Unlock()
-	sigterm(cmd)
+	for _, cmd := range cmds {
+		sigterm(cmd)
+	}
 	return nil
 }
 
@@ -392,6 +440,29 @@ func (rec *runRec) waitIfPaused() error {
 		return fmt.Errorf("stopped")
 	}
 	return nil
+}
+
+func (rec *runRec) addCmd(cmd *exec.Cmd) {
+	rec.mu.Lock()
+	rec.cmds = append(rec.cmds, cmd)
+	rec.mu.Unlock()
+}
+
+func (rec *runRec) removeCmd(cmd *exec.Cmd) {
+	rec.mu.Lock()
+	for i, c := range rec.cmds {
+		if c == cmd {
+			rec.cmds = append(rec.cmds[:i], rec.cmds[i+1:]...)
+			break
+		}
+	}
+	rec.mu.Unlock()
+}
+
+func (rec *runRec) appendProcessRun(pr ProcessRun) {
+	rec.mu.Lock()
+	rec.run.ProcessRuns = append(rec.run.ProcessRuns, pr)
+	rec.mu.Unlock()
 }
 
 func sigterm(cmd *exec.Cmd) {
@@ -539,11 +610,84 @@ func (e *Engine) runSeries(rec *runRec, project string, step stepDef, env []stri
 		if rec.isStopped() {
 			return fmt.Errorf("stopped")
 		}
-		if err := e.runProcess(rec, project, p, env, argOverrides, jl); err != nil {
+		pr, err := e.runProcess(rec, project, p, env, argOverrides, jl, nil)
+		rec.appendProcessRun(pr)
+		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (e *Engine) runParallel(rec *runRec, project string, step stepDef, env []string, argOverrides map[string][]string, jl *jsonl) error {
+	type slot struct {
+		def  processDef
+		cmd  *exec.Cmd
+		term atomic.Bool
+		pr   ProcessRun
+	}
+	slots := make([]*slot, len(step.Processes))
+	for i, p := range step.Processes {
+		cmd, err := e.startCmd(project, p, env, argOverrides, jl)
+		if err != nil {
+			return err
+		}
+		rec.addCmd(cmd)
+		if rec.isStopped() {
+			sigterm(cmd)
+		}
+		slots[i] = &slot{def: p, cmd: cmd}
+	}
+
+	var failOnce sync.Once
+	var firstErr error
+	var mu sync.Mutex
+	sigtermSiblings := func(failed *slot) {
+		failOnce.Do(func() {
+			for _, s := range slots {
+				if s == failed || s.cmd.Process == nil {
+					continue
+				}
+				s.term.Store(true)
+				_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGTERM)
+				_ = jl.Append(map[string]any{"type": "process_sigterm", "processId": s.def.ID})
+			}
+		})
+	}
+
+	var wg sync.WaitGroup
+	for _, s := range slots {
+		wg.Add(1)
+		go func(s *slot) {
+			defer wg.Done()
+			pr, err := e.waitCmd(s.def, s.cmd, jl, &s.term)
+			rec.removeCmd(s.cmd)
+			if rec.isStopped() && pr.Status != StatusStopped {
+				pr.Status = StatusStopped
+				err = fmt.Errorf("stopped")
+			}
+			mu.Lock()
+			s.pr = pr
+			if err != nil && pr.Status != StatusStopped {
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				sigtermSiblings(s)
+				return
+			}
+			if err != nil && firstErr == nil && rec.isStopped() {
+				firstErr = err
+			}
+			mu.Unlock()
+		}(s)
+	}
+	wg.Wait()
+
+	for _, s := range slots {
+		rec.appendProcessRun(s.pr)
+	}
+	return firstErr
 }
 
 func (e *Engine) runDecision(rec *runRec, project string, step stepDef, inputs map[string]string, env []string, argOverrides map[string][]string, jl *jsonl) error {
@@ -567,7 +711,30 @@ func (e *Engine) runDecision(rec *runRec, project string, step stepDef, inputs m
 		}
 		return fmt.Errorf("decision step %q: multiple processes matched: %v", step.ID, ids)
 	}
-	return e.runProcess(rec, project, matched[0], env, argOverrides, jl)
+	pr, err := e.runProcess(rec, project, matched[0], env, argOverrides, jl, nil)
+	rec.appendProcessRun(pr)
+	return err
+}
+
+// runLoop runs Processes then returns steps[] delta: -1 previous, +1 next.
+// when true → previous; when false/nil-match → next.
+func (e *Engine) runLoop(rec *runRec, project string, step stepDef, inputs map[string]string, env []string, argOverrides map[string][]string, jl *jsonl, idx int) (int, error) {
+	if err := e.runSeries(rec, project, step, env, argOverrides, jl); err != nil {
+		return 0, err
+	}
+	back, err := predicateMatches(step.When, inputs)
+	if err != nil {
+		return 0, err
+	}
+	if back {
+		if idx == 0 {
+			return 0, fmt.Errorf("loop step %q: no previous step", step.ID)
+		}
+		_ = jl.Append(map[string]any{"type": "loop_branch", "stepId": step.ID, "direction": "previous"})
+		return -1, nil
+	}
+	_ = jl.Append(map[string]any{"type": "loop_branch", "stepId": step.ID, "direction": "next"})
+	return 1, nil
 }
 
 func predicateMatches(p *predicateDef, inputs map[string]string) (bool, error) {
@@ -608,7 +775,28 @@ func predicateMatches(p *predicateDef, inputs map[string]string) (bool, error) {
 	}
 }
 
-func (e *Engine) runProcess(rec *runRec, project string, p processDef, env []string, argOverrides map[string][]string, jl *jsonl) error {
+func (e *Engine) runProcess(rec *runRec, project string, p processDef, env []string, argOverrides map[string][]string, jl *jsonl, termFlag *atomic.Bool) (ProcessRun, error) {
+	cmd, err := e.startCmd(project, p, env, argOverrides, jl)
+	if err != nil {
+		return ProcessRun{ProcessID: p.ID, Status: StatusFailed}, err
+	}
+	rec.addCmd(cmd)
+	if rec.isStopped() {
+		sigterm(cmd)
+	}
+	pr, err := e.waitCmd(p, cmd, jl, termFlag)
+	rec.removeCmd(cmd)
+	if rec.isStopped() {
+		if pr.Status != StatusStopped {
+			_ = jl.Append(map[string]any{"type": "process_stopped", "processId": p.ID, "exitCode": pr.ExitCode})
+			pr.Status = StatusStopped
+		}
+		return pr, fmt.Errorf("stopped")
+	}
+	return pr, err
+}
+
+func (e *Engine) startCmd(project string, p processDef, env []string, argOverrides map[string][]string, jl *jsonl) (*exec.Cmd, error) {
 	_ = jl.Append(map[string]any{"type": "process_started", "processId": p.ID, "command": p.Command})
 
 	cwd := project
@@ -633,55 +821,43 @@ func (e *Engine) runProcess(rec *runRec, project string, p processDef, env []str
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
-		return err
+		return nil, err
 	}
 
-	rec.mu.Lock()
-	rec.cmd = cmd
-	stopped := rec.stopped
-	rec.mu.Unlock()
-	if stopped {
-		sigterm(cmd)
-	}
+	go pipeLines(jl, "stdout", p.ID, stdout)
+	go pipeLines(jl, "stderr", p.ID, stderr)
+	return cmd, nil
+}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); pipeLines(jl, "stdout", p.ID, stdout) }()
-	go func() { defer wg.Done(); pipeLines(jl, "stderr", p.ID, stderr) }()
-	wg.Wait()
-
-	err = cmd.Wait()
-	rec.mu.Lock()
-	rec.cmd = nil
-	stopped = rec.stopped
-	rec.mu.Unlock()
-	if stopped {
-		_ = jl.Append(map[string]any{"type": "process_stopped", "processId": p.ID})
-		return fmt.Errorf("stopped")
-	}
-
+func (e *Engine) waitCmd(p processDef, cmd *exec.Cmd, jl *jsonl, termFlag *atomic.Bool) (ProcessRun, error) {
+	err := cmd.Wait()
 	exit := 0
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			exit = ee.ExitCode()
 		} else {
 			_ = jl.Append(map[string]any{"type": "process_failed", "processId": p.ID, "error": err.Error()})
-			return err
+			return ProcessRun{ProcessID: p.ID, Status: StatusFailed}, err
 		}
+	}
+
+	if termFlag != nil && termFlag.Load() {
+		_ = jl.Append(map[string]any{"type": "process_stopped", "processId": p.ID, "exitCode": exit})
+		return ProcessRun{ProcessID: p.ID, Status: StatusStopped, ExitCode: exit}, fmt.Errorf("process %s stopped", p.ID)
 	}
 	if exit != 0 {
 		_ = jl.Append(map[string]any{"type": "process_failed", "processId": p.ID, "exitCode": exit})
-		return fmt.Errorf("process %s exited %d", p.ID, exit)
+		return ProcessRun{ProcessID: p.ID, Status: StatusFailed, ExitCode: exit}, fmt.Errorf("process %s exited %d", p.ID, exit)
 	}
 	_ = jl.Append(map[string]any{"type": "process_succeeded", "processId": p.ID, "exitCode": 0})
-	return nil
+	return ProcessRun{ProcessID: p.ID, Status: StatusSucceeded, ExitCode: 0}, nil
 }
 
 func pipeLines(jl *jsonl, stream, processID string, r io.Reader) {
