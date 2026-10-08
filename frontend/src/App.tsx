@@ -85,8 +85,15 @@ function Shell({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
+type HomeWorkflow = Workflow & { repo: string };
+type HomeRun = WorkflowRun & { repo: string };
+
+const HOME_RUN_CAP = 50;
+
 function Home() {
   const [repos, setRepos] = useState<Repo[]>([]);
+  const [workflows, setWorkflows] = useState<HomeWorkflow[]>([]);
+  const [runs, setRuns] = useState<HomeRun[]>([]);
   const [error, setError] = useState("");
   useEffect(() => {
     void (async () => {
@@ -95,23 +102,93 @@ function Home() {
         setError(typeof err === "string" ? err : "failed to list Repos");
         return;
       }
-      setRepos(data ?? []);
+      const list = data ?? [];
+      setRepos(list);
+      // ponytail: client fan-out; aggregate API if repo count hurts latency
+      const wfChunks = await Promise.all(
+        list.map(async (r) => {
+          const res = await api.GET("/api/workflows/{repo}", {
+            params: { path: { repo: r.name } },
+          });
+          return (res.data ?? []).map((w) => ({ ...w, repo: r.name }));
+        }),
+      );
+      const runChunks = await Promise.all(
+        list.map(async (r) => {
+          const res = await api.GET("/api/runs/{repo}", {
+            params: { path: { repo: r.name } },
+          });
+          return (res.data ?? []).map((run) => ({ ...run, repo: r.name }));
+        }),
+      );
+      const allWf = wfChunks.flat().sort((a, b) => {
+        const byRepo = a.repo.localeCompare(b.repo);
+        if (byRepo !== 0) return byRepo;
+        return (a.id ?? "").localeCompare(b.id ?? "");
+      });
+      const allRuns = runChunks
+        .flat()
+        .sort((a, b) => (b.id ?? "").localeCompare(a.id ?? ""))
+        .slice(0, HOME_RUN_CAP);
+      setWorkflows(allWf);
+      setRuns(allRuns);
     })();
   }, []);
   return (
-    <Shell title="Repos">
+    <Shell title="Home">
       {error && <p className="debugger-error">{error}</p>}
       {repos.length === 0 ? (
         <p className="muted">No Repos registered. Use subspace repo add.</p>
       ) : (
-        <ul className="history-list">
-          {repos.map((r) => (
-            <li key={r.name}>
-              <Link href={`/workflows/${encodeURIComponent(r.name)}`}>{r.name}</Link>
-              <span> · {r.absolutePath}</span>
-            </li>
-          ))}
-        </ul>
+        <>
+          <h2 style={{ fontSize: "1rem" }}>Repos</h2>
+          <ul className="history-list">
+            {repos.map((r) => (
+              <li key={r.name}>
+                <Link href={`/workflows/${encodeURIComponent(r.name)}`}>{r.name}</Link>
+                <span> · {r.absolutePath}</span>
+              </li>
+            ))}
+          </ul>
+          <h2 style={{ marginTop: "1.5rem", fontSize: "1rem" }}>Workflows</h2>
+          {workflows.length === 0 ? (
+            <p className="muted">No Workflows yet.</p>
+          ) : (
+            <ul className="history-list">
+              {workflows.map((w) => (
+                <li key={`${w.repo}/${w.id}`}>
+                  <Link
+                    href={`/workflows/${encodeURIComponent(w.repo)}/${encodeURIComponent(w.id)}`}
+                  >
+                    {w.name || w.id}
+                  </Link>
+                  <span>
+                    {" "}
+                    · {w.repo} · {w.id}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <h2 style={{ marginTop: "1.5rem", fontSize: "1rem" }}>Recent WorkflowRuns</h2>
+          {runs.length === 0 ? (
+            <p className="muted">No WorkflowRuns yet.</p>
+          ) : (
+            <ul className="history-list">
+              {runs.map((r) => (
+                <li key={`${r.repo}/${r.id}`}>
+                  <Link href={`/runs/${encodeURIComponent(r.repo)}/${encodeURIComponent(r.id)}`}>
+                    {r.id}
+                  </Link>
+                  <span>
+                    {" "}
+                    · {r.repo} · {r.workflowId} · {r.status}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
       )}
     </Shell>
   );
