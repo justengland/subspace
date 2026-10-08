@@ -324,6 +324,191 @@ steps:
 	}
 }
 
+func TestLoopForwardGoesToNextStep(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(project, "a.sh"), "#!/bin/sh\necho a >> \"$PWD/log\"\n")
+	writeFile(t, filepath.Join(project, "loop.sh"), "#!/bin/sh\necho loop >> \"$PWD/log\"\n")
+	writeFile(t, filepath.Join(project, "b.sh"), "#!/bin/sh\necho b >> \"$PWD/log\"\n")
+	chmodX(t, filepath.Join(project, "a.sh"))
+	chmodX(t, filepath.Join(project, "loop.sh"))
+	chmodX(t, filepath.Join(project, "b.sh"))
+
+	// when false → next (forward). cont≠yes so Loop advances to after.
+	writeFile(t, filepath.Join(workflows, "loop.yaml"), `
+id: loop
+steps:
+  - id: before
+    mode: series
+    outputs:
+      - name: cont
+        value: no
+    processes:
+      - id: run-a
+        command: ./a.sh
+  - id: bounce
+    mode: loop
+    inputs:
+      - name: cont
+        source:
+          stepId: before
+          output: cont
+    when:
+      eq:
+        input: cont
+        value: yes
+    processes:
+      - id: run-loop
+        command: ./loop.sh
+  - id: after
+    mode: series
+    processes:
+      - id: run-b
+        command: ./b.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{WorkflowID: "loop", ProjectPath: project})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if run.Status != engine.StatusSucceeded {
+		t.Fatalf("status=%s want succeeded", run.Status)
+	}
+	log := readFile(t, filepath.Join(project, "log"))
+	if strings.TrimSpace(log) != "a\nloop\nb" {
+		t.Fatalf("log=%q want a, loop, b once each", log)
+	}
+}
+
+func TestLoopBackwardGoesToPreviousStep(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(project, "a.sh"), "#!/bin/sh\necho a >> \"$PWD/log\"\n")
+	writeFile(t, filepath.Join(project, "loop.sh"), "#!/bin/sh\necho loop >> \"$PWD/log\"\n")
+	writeFile(t, filepath.Join(project, "b.sh"), "#!/bin/sh\necho b >> \"$PWD/log\"\n")
+	chmodX(t, filepath.Join(project, "a.sh"))
+	chmodX(t, filepath.Join(project, "loop.sh"))
+	chmodX(t, filepath.Join(project, "b.sh"))
+
+	// when true → previous. maxIterations 2: before,bounce,before,bounce then fail on 3rd bounce entry.
+	writeFile(t, filepath.Join(workflows, "loop.yaml"), `
+id: loop
+steps:
+  - id: before
+    mode: series
+    outputs:
+      - name: cont
+        value: yes
+    processes:
+      - id: run-a
+        command: ./a.sh
+  - id: bounce
+    mode: loop
+    maxIterations: 2
+    inputs:
+      - name: cont
+        source:
+          stepId: before
+          output: cont
+    when:
+      eq:
+        input: cont
+        value: yes
+    processes:
+      - id: run-loop
+        command: ./loop.sh
+  - id: after
+    mode: series
+    processes:
+      - id: run-b
+        command: ./b.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{WorkflowID: "loop", ProjectPath: project})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if run.Status != engine.StatusFailed {
+		t.Fatalf("status=%s want failed (cap after backward hops)", run.Status)
+	}
+	log := readFile(t, filepath.Join(project, "log"))
+	// 2 loop bodies, then previous runs once more before 3rd Loop entry fails the cap
+	if strings.TrimSpace(log) != "a\nloop\na\nloop\na" {
+		t.Fatalf("log=%q want a,loop,a,loop,a (backward then cap)", log)
+	}
+	if strings.Contains(log, "b") {
+		t.Fatal("after step should not run")
+	}
+}
+
+func TestLoopMaxIterationsFailsStepRun(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(project, "a.sh"), "#!/bin/sh\necho a >> \"$PWD/log\"\n")
+	writeFile(t, filepath.Join(project, "loop.sh"), "#!/bin/sh\necho loop >> \"$PWD/log\"\n")
+	chmodX(t, filepath.Join(project, "a.sh"))
+	chmodX(t, filepath.Join(project, "loop.sh"))
+
+	// default maxIterations=3; always previous → fail on 4th Loop entry
+	writeFile(t, filepath.Join(workflows, "loop.yaml"), `
+id: loop
+steps:
+  - id: before
+    mode: series
+    outputs:
+      - name: cont
+        value: yes
+    processes:
+      - id: run-a
+        command: ./a.sh
+  - id: bounce
+    mode: loop
+    inputs:
+      - name: cont
+        source:
+          stepId: before
+          output: cont
+    when:
+      eq:
+        input: cont
+        value: yes
+    processes:
+      - id: run-loop
+        command: ./loop.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{WorkflowID: "loop", ProjectPath: project})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if run.Status != engine.StatusFailed {
+		t.Fatalf("status=%s want failed", run.Status)
+	}
+	log := readFile(t, filepath.Join(project, "log"))
+	// 3 loop bodies; 4th Loop entry fails after previous re-runs once more
+	if strings.TrimSpace(log) != "a\nloop\na\nloop\na\nloop\na" {
+		t.Fatalf("log=%q want 3 loop iterations then cap", log)
+	}
+}
+
 func TestConnectionsDerivedFromInputSource(t *testing.T) {
 	root := t.TempDir()
 	workflows := filepath.Join(root, "workflows")
@@ -363,6 +548,15 @@ steps:
 	if c.SourceStepID != "produce" || c.SourceOutput != "msg" || c.TargetStepID != "consume" || c.TargetInput != "msg" {
 		t.Fatalf("connection=%+v", c)
 	}
+}
+
+func readFile(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 func mustMkdir(t *testing.T, p string) {

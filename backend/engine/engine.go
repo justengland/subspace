@@ -88,12 +88,14 @@ type workflowDef struct {
 }
 
 type stepDef struct {
-	ID        string       `yaml:"id"`
-	Name      string       `yaml:"name"`
-	Mode      string       `yaml:"mode"`
-	Inputs    []inputDef   `yaml:"inputs"`
-	Outputs   []outputDef  `yaml:"outputs"`
-	Processes []processDef `yaml:"processes"`
+	ID            string        `yaml:"id"`
+	Name          string        `yaml:"name"`
+	Mode          string        `yaml:"mode"`
+	MaxIterations *int          `yaml:"maxIterations"`
+	When          *predicateDef `yaml:"when"`
+	Inputs        []inputDef    `yaml:"inputs"`
+	Outputs       []outputDef   `yaml:"outputs"`
+	Processes     []processDef  `yaml:"processes"`
 }
 
 type inputDef struct {
@@ -179,8 +181,10 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 
 	// stepID -> outputName -> value (populated as Steps complete)
 	outputs := map[string]map[string]string{}
+	loopIters := map[string]int{}
 
-	for _, step := range wf.Steps {
+	for i := 0; i < len(wf.Steps); {
+		step := wf.Steps[i]
 		mode := step.Mode
 		if mode == "" {
 			mode = "series"
@@ -191,12 +195,40 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
 			return run, nil
 		}
-		_ = jl.Append(map[string]any{"type": "step_started", "stepId": step.ID, "mode": mode})
+
+		iteration := 0
+		if mode == "loop" {
+			loopIters[step.ID]++
+			iteration = loopIters[step.ID]
+			max := 3
+			if step.MaxIterations != nil {
+				max = *step.MaxIterations
+			}
+			if iteration > max {
+				err := fmt.Errorf("loop step %q: maxIterations %d exceeded", step.ID, max)
+				run.Status = StatusFailed
+				_ = jl.Append(map[string]any{"type": "step_started", "stepId": step.ID, "mode": mode, "iteration": iteration})
+				_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
+				return run, nil
+			}
+		}
+
+		ev := map[string]any{"type": "step_started", "stepId": step.ID, "mode": mode}
+		if iteration > 0 {
+			ev["iteration"] = iteration
+		}
+		_ = jl.Append(ev)
+
+		var delta int
 		switch mode {
 		case "series":
 			err = e.runSeries(project, step, env, jl)
+			delta = 1
 		case "decision":
 			err = e.runDecision(project, step, inputs, env, jl)
+			delta = 1
+		case "loop":
+			delta, err = e.runLoop(project, step, inputs, env, jl, i)
 		default:
 			err = fmt.Errorf("unsupported mode %q", mode)
 		}
@@ -211,6 +243,7 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 		}
 		outputs[step.ID] = stepOut
 		_ = jl.Append(map[string]any{"type": "step_succeeded", "stepId": step.ID})
+		i += delta
 	}
 
 	run.Status = StatusSucceeded
@@ -338,6 +371,27 @@ func (e *Engine) runDecision(project string, step stepDef, inputs map[string]str
 		return fmt.Errorf("decision step %q: multiple processes matched: %v", step.ID, ids)
 	}
 	return e.runProcess(project, matched[0], env, jl)
+}
+
+// runLoop runs Processes then returns steps[] delta: -1 previous, +1 next.
+// when true → previous; when false/nil-match → next.
+func (e *Engine) runLoop(project string, step stepDef, inputs map[string]string, env []string, jl *jsonl, idx int) (int, error) {
+	if err := e.runSeries(project, step, env, jl); err != nil {
+		return 0, err
+	}
+	back, err := predicateMatches(step.When, inputs)
+	if err != nil {
+		return 0, err
+	}
+	if back {
+		if idx == 0 {
+			return 0, fmt.Errorf("loop step %q: no previous step", step.ID)
+		}
+		_ = jl.Append(map[string]any{"type": "loop_branch", "stepId": step.ID, "direction": "previous"})
+		return -1, nil
+	}
+	_ = jl.Append(map[string]any{"type": "loop_branch", "stepId": step.ID, "direction": "next"})
+	return 1, nil
 }
 
 func predicateMatches(p *predicateDef, inputs map[string]string) (bool, error) {
