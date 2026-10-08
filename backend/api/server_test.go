@@ -14,6 +14,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/justengland/subspace/backend/api"
 	"github.com/justengland/subspace/backend/engine"
+	"github.com/justengland/subspace/backend/registry"
 )
 
 func TestHTTPStartAndGet(t *testing.T) {
@@ -230,10 +231,15 @@ steps:
 }
 
 func TestHTTPGetWorkflowConnections(t *testing.T) {
-	root := t.TempDir()
-	workflows := filepath.Join(root, "workflows")
-	_ = os.MkdirAll(workflows, 0o755)
-	_ = os.WriteFile(filepath.Join(workflows, "pipe.yaml"), []byte(`
+	home := t.TempDir()
+	proj := filepath.Join(home, "proj")
+	_ = os.MkdirAll(proj, 0o755)
+	if err := registry.Add(home, "demo", proj); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(home, "demo", "workflows")
+	_ = os.MkdirAll(dir, 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "pipe.yaml"), []byte(`
 id: pipe
 steps:
   - id: produce
@@ -254,11 +260,11 @@ steps:
         command: true
 `), 0o644)
 
-	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: filepath.Join(root, "storage")})
-	h := (&api.Server{Eng: eng}).Handler()
+	eng := engine.New(engine.Config{StorageRoot: home})
+	h := (&api.Server{Eng: eng, Home: home}).Handler()
 
 	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/workflows/pipe", nil))
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/workflows/demo/pipe", nil))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rr.Code, rr.Body)
 	}

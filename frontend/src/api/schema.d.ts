@@ -36,7 +36,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/workflows/{id}": {
+    "/api/workflows/{repo}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listWorkflows"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workflows/{repo}/{workflowId}": {
         parameters: {
             query?: never;
             header?: never;
@@ -280,6 +296,8 @@ export interface components {
         };
     };
     parameters: {
+        /** @description Registered Repo name */
+        RepoName: string;
         Id: string;
     };
     requestBodies: never;
@@ -331,12 +349,39 @@ export interface operations {
             500: components["responses"]["TextError"];
         };
     };
+    listWorkflows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Workflows for the Repo under Subspace home */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Workflow"][];
+                };
+            };
+            404: components["responses"]["TextError"];
+            500: components["responses"]["TextError"];
+        };
+    };
     getWorkflow: {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["Id"];
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                workflowId: string;
             };
             cookie?: never;
         };

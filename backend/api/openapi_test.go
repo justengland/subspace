@@ -22,6 +22,8 @@ func TestOpenAPICoversControlPlane(t *testing.T) {
 	doc := string(b)
 	for _, path := range []string{
 		"/api/repos:",
+		"/api/workflows/{repo}:",
+		"/api/workflows/{repo}/{workflowId}:",
 		"/api/runs:",
 		"/api/runs/{id}:",
 		"/api/runs/{id}/pause:",
@@ -35,6 +37,7 @@ func TestOpenAPICoversControlPlane(t *testing.T) {
 		"argumentOverrides:",
 		"operationId: listRuns",
 		"operationId: listRepos",
+		"operationId: listWorkflows",
 	} {
 		if !strings.Contains(doc, path) {
 			t.Fatalf("openapi.yaml missing %q", path)

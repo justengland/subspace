@@ -42,6 +42,20 @@ func List(home string) ([]Repo, error) {
 	return out, nil
 }
 
+// Has reports whether name is registered in home/repos.json.
+func Has(home, name string) (bool, error) {
+	repos, err := List(home)
+	if err != nil {
+		return false, err
+	}
+	for _, r := range repos {
+		if r.Name == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // Add registers name → absolutePath in home/repos.json, creating the file if needed.
 func Add(home, name, path string) error {
 	abs, err := filepath.Abs(path)

@@ -36,11 +36,34 @@ paths:
                   $ref: "#/components/schemas/Repo"
         "500":
           $ref: "#/components/responses/TextError"
-  /api/workflows/{id}:
+  /api/workflows/{repo}:
+    get:
+      operationId: listWorkflows
+      parameters:
+        - $ref: "#/components/parameters/RepoName"
+      responses:
+        "200":
+          description: Workflows for the Repo under Subspace home
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Workflow"
+        "404":
+          $ref: "#/components/responses/TextError"
+        "500":
+          $ref: "#/components/responses/TextError"
+  /api/workflows/{repo}/{workflowId}:
     get:
       operationId: getWorkflow
       parameters:
-        - $ref: "#/components/parameters/Id"
+        - $ref: "#/components/parameters/RepoName"
+        - name: workflowId
+          in: path
+          required: true
+          schema:
+            type: string
       responses:
         "200":
           description: Workflow with derived Connections
@@ -180,6 +203,13 @@ paths:
 
 components:
   parameters:
+    RepoName:
+      name: repo
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Registered Repo name
     Id:
       name: id
       in: path

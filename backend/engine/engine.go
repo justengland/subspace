@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -715,6 +716,58 @@ func (e *Engine) GetWorkflow(id string) (*Workflow, error) {
 		return nil, err
 	}
 	return toWorkflowView(wf), nil
+}
+
+// ListWorkflows returns Workflows under StorageRoot/<repo>/workflows/*.yaml.
+func (e *Engine) ListWorkflows(repo string) ([]Workflow, error) {
+	dir := filepath.Join(e.cfg.StorageRoot, repo, "workflows")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []Workflow{}, nil
+		}
+		return nil, err
+	}
+	out := []Workflow{}
+	for _, ent := range entries {
+		name := ent.Name()
+		if ent.IsDir() || filepath.Ext(name) != ".yaml" {
+			continue
+		}
+		id := strings.TrimSuffix(name, ".yaml")
+		wf, err := e.loadWorkflowInRepo(repo, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *toWorkflowView(wf))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// GetWorkflowInRepo loads one Workflow from StorageRoot/<repo>/workflows/<id>.yaml.
+func (e *Engine) GetWorkflowInRepo(repo, id string) (*Workflow, error) {
+	wf, err := e.loadWorkflowInRepo(repo, id)
+	if err != nil {
+		return nil, err
+	}
+	return toWorkflowView(wf), nil
+}
+
+func (e *Engine) loadWorkflowInRepo(repo, id string) (*workflowDef, error) {
+	path := filepath.Join(e.cfg.StorageRoot, repo, "workflows", id+".yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("load workflow %q/%q: %w", repo, id, err)
+	}
+	var wf workflowDef
+	if err := yaml.Unmarshal(data, &wf); err != nil {
+		return nil, err
+	}
+	if wf.ID == "" {
+		wf.ID = id
+	}
+	return &wf, nil
 }
 
 func toWorkflowView(wf *workflowDef) *Workflow {

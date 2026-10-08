@@ -28,7 +28,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/runs/{id}/resume", s.resumeRun)
 	mux.HandleFunc("POST /api/runs/{id}/stop", s.stopRun)
 	mux.HandleFunc("POST /api/runs/{id}/rewind", s.rewindRun)
-	mux.HandleFunc("GET /api/workflows/{id}", s.getWorkflow)
+	mux.HandleFunc("GET /api/workflows/{repo}/{workflowId}", s.getWorkflow)
+	mux.HandleFunc("GET /api/workflows/{repo}", s.listWorkflows)
 	mux.HandleFunc("GET /api/repos", s.listRepos)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -134,13 +135,47 @@ func (s *Server) writeRun(w http.ResponseWriter, id string) {
 	writeJSON(w, http.StatusOK, run)
 }
 
-func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
+func (s *Server) requireRepo(w http.ResponseWriter, name string) bool {
+	ok, err := registry.Has(s.Home, name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return false
+	}
+	if !ok {
+		http.Error(w, "unknown repo: "+name, http.StatusNotFound)
+		return false
+	}
+	return true
+}
+
+func (s *Server) listWorkflows(w http.ResponseWriter, r *http.Request) {
+	repo := r.PathValue("repo")
+	if repo == "" {
+		http.Error(w, "missing repo", http.StatusBadRequest)
 		return
 	}
-	wf, err := s.Eng.GetWorkflow(id)
+	if !s.requireRepo(w, repo) {
+		return
+	}
+	list, err := s.Eng.ListWorkflows(repo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
+	repo := r.PathValue("repo")
+	id := r.PathValue("workflowId")
+	if repo == "" || id == "" {
+		http.Error(w, "missing repo or workflowId", http.StatusBadRequest)
+		return
+	}
+	if !s.requireRepo(w, repo) {
+		return
+	}
+	wf, err := s.Eng.GetWorkflowInRepo(repo, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
