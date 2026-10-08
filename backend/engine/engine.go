@@ -55,6 +55,45 @@ type WorkflowRun struct {
 	Status      string `json:"status"`
 }
 
+// Connection is a derived edge from Input.source (not stored in YAML).
+type Connection struct {
+	SourceStepID string `json:"sourceStepId"`
+	SourceOutput string `json:"sourceOutput"`
+	TargetStepID string `json:"targetStepId"`
+	TargetInput  string `json:"targetInput"`
+}
+
+// Workflow is the Engine-facing definition view (Connections derived on read).
+type Workflow struct {
+	ID          string       `json:"id"`
+	Name        string       `json:"name"`
+	Steps       []StepView   `json:"steps"`
+	Connections []Connection `json:"connections"`
+}
+
+type StepView struct {
+	ID      string       `json:"id"`
+	Name    string       `json:"name"`
+	Mode    string       `json:"mode"`
+	Inputs  []InputView  `json:"inputs,omitempty"`
+	Outputs []OutputView `json:"outputs,omitempty"`
+}
+
+type InputView struct {
+	Name   string      `json:"name"`
+	Source *SourceView `json:"source,omitempty"`
+}
+
+type OutputView struct {
+	Name  string `json:"name"`
+	Value string `json:"value,omitempty"`
+}
+
+type SourceView struct {
+	StepID string `json:"stepId"`
+	Output string `json:"output"`
+}
+
 type workflowDef struct {
 	ID    string    `yaml:"id"`
 	Name  string    `yaml:"name"`
@@ -65,7 +104,24 @@ type stepDef struct {
 	ID        string       `yaml:"id"`
 	Name      string       `yaml:"name"`
 	Mode      string       `yaml:"mode"`
+	Inputs    []inputDef   `yaml:"inputs"`
+	Outputs   []outputDef  `yaml:"outputs"`
 	Processes []processDef `yaml:"processes"`
+}
+
+type inputDef struct {
+	Name   string     `yaml:"name"`
+	Source *sourceDef `yaml:"source"`
+}
+
+type outputDef struct {
+	Name  string `yaml:"name"`
+	Value string `yaml:"value"`
+}
+
+type sourceDef struct {
+	StepID string `yaml:"stepId"`
+	Output string `yaml:"output"`
 }
 
 type processDef struct {
@@ -183,7 +239,6 @@ func sigterm(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	// Process group so sleep/children get SIGTERM too.
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 }
 
@@ -201,6 +256,8 @@ func (e *Engine) execute(ar *activeRun, wf *workflowDef, project string, jl *jso
 	defer jl.Close()
 	_ = jl.Append(map[string]any{"type": "workflow_started", "workflowId": wf.ID, "runId": ar.run.ID})
 
+	outputs := map[string]map[string]string{}
+
 	for _, step := range wf.Steps {
 		if ar.isStopped() {
 			_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": ar.run.ID})
@@ -217,10 +274,16 @@ func (e *Engine) execute(ar *activeRun, wf *workflowDef, project string, jl *jso
 		if mode == "" {
 			mode = "series"
 		}
+		env, err := resolveInputs(step, outputs)
+		if err != nil {
+			ar.setStatus(StatusFailed)
+			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
+			return
+		}
 		_ = jl.Append(map[string]any{"type": "step_started", "stepId": step.ID, "mode": mode})
 		switch mode {
 		case "series":
-			if err := e.runSeries(ar, project, step, jl); err != nil {
+			if err := e.runSeries(ar, project, step, env, jl); err != nil {
 				if ar.isStopped() {
 					_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": ar.run.ID})
 					ar.setStatus(StatusStopped)
@@ -236,9 +299,13 @@ func (e *Engine) execute(ar *activeRun, wf *workflowDef, project string, jl *jso
 			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
 			return
 		}
+		stepOut := map[string]string{}
+		for _, o := range step.Outputs {
+			stepOut[o.Name] = o.Value
+		}
+		outputs[step.ID] = stepOut
 		_ = jl.Append(map[string]any{"type": "step_succeeded", "stepId": step.ID})
 
-		// Hold after current Step's ProcessRuns finish, before next Step.
 		if err := ar.waitIfPaused(); err != nil {
 			_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": ar.run.ID})
 			ar.setStatus(StatusStopped)
@@ -288,6 +355,66 @@ func (ar *activeRun) waitIfPaused() error {
 	return nil
 }
 
+func (e *Engine) GetWorkflow(id string) (*Workflow, error) {
+	wf, err := e.loadWorkflow(id)
+	if err != nil {
+		return nil, err
+	}
+	return toWorkflowView(wf), nil
+}
+
+func toWorkflowView(wf *workflowDef) *Workflow {
+	out := &Workflow{ID: wf.ID, Name: wf.Name}
+	for _, s := range wf.Steps {
+		sv := StepView{ID: s.ID, Name: s.Name, Mode: s.Mode}
+		for _, in := range s.Inputs {
+			iv := InputView{Name: in.Name}
+			if in.Source != nil {
+				iv.Source = &SourceView{StepID: in.Source.StepID, Output: in.Source.Output}
+			}
+			sv.Inputs = append(sv.Inputs, iv)
+		}
+		for _, o := range s.Outputs {
+			sv.Outputs = append(sv.Outputs, OutputView{Name: o.Name, Value: o.Value})
+		}
+		out.Steps = append(out.Steps, sv)
+		for _, in := range s.Inputs {
+			if in.Source == nil {
+				continue
+			}
+			out.Connections = append(out.Connections, Connection{
+				SourceStepID: in.Source.StepID,
+				SourceOutput: in.Source.Output,
+				TargetStepID: s.ID,
+				TargetInput:  in.Name,
+			})
+		}
+	}
+	if out.Connections == nil {
+		out.Connections = []Connection{}
+	}
+	return out
+}
+
+func resolveInputs(step stepDef, outputs map[string]map[string]string) ([]string, error) {
+	var env []string
+	for _, in := range step.Inputs {
+		if in.Source == nil {
+			continue
+		}
+		stepOut, ok := outputs[in.Source.StepID]
+		if !ok {
+			return nil, fmt.Errorf("input %q: step %q has no outputs yet", in.Name, in.Source.StepID)
+		}
+		val, ok := stepOut[in.Source.Output]
+		if !ok {
+			return nil, fmt.Errorf("input %q: output %q.%q not found", in.Name, in.Source.StepID, in.Source.Output)
+		}
+		env = append(env, fmt.Sprintf("SUBSPACE_INPUT_%s=%s", in.Name, val))
+	}
+	return env, nil
+}
+
 func (e *Engine) loadWorkflow(id string) (*workflowDef, error) {
 	path := filepath.Join(e.cfg.WorkflowsDir, id+".yaml")
 	data, err := os.ReadFile(path)
@@ -304,19 +431,19 @@ func (e *Engine) loadWorkflow(id string) (*workflowDef, error) {
 	return &wf, nil
 }
 
-func (e *Engine) runSeries(ar *activeRun, project string, step stepDef, jl *jsonl) error {
+func (e *Engine) runSeries(ar *activeRun, project string, step stepDef, env []string, jl *jsonl) error {
 	for _, p := range step.Processes {
 		if ar.isStopped() {
 			return fmt.Errorf("stopped")
 		}
-		if err := e.runProcess(ar, project, p, jl); err != nil {
+		if err := e.runProcess(ar, project, p, env, jl); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (e *Engine) runProcess(ar *activeRun, project string, p processDef, jl *jsonl) error {
+func (e *Engine) runProcess(ar *activeRun, project string, p processDef, env []string, jl *jsonl) error {
 	_ = jl.Append(map[string]any{"type": "process_started", "processId": p.ID, "command": p.Command})
 
 	cwd := project
@@ -331,6 +458,9 @@ func (e *Engine) runProcess(ar *activeRun, project string, p processDef, jl *jso
 	cmd := exec.Command(p.Command, p.Arguments...)
 	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

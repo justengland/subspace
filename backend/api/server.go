@@ -19,6 +19,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/runs/{id}/pause", s.pauseRun)
 	mux.HandleFunc("POST /api/runs/{id}/resume", s.resumeRun)
 	mux.HandleFunc("POST /api/runs/{id}/stop", s.stopRun)
+	mux.HandleFunc("GET /api/workflows/", s.getWorkflow)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -87,6 +88,20 @@ func (s *Server) writeRun(w http.ResponseWriter, id string) {
 		return
 	}
 	writeJSON(w, http.StatusOK, run)
+}
+
+func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/workflows/")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	wf, err := s.Eng.GetWorkflow(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, wf)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
