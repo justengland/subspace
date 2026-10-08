@@ -30,11 +30,14 @@ type Config struct {
 type Engine struct {
 	cfg  Config
 	mu   sync.Mutex
-	runs map[string]*activeRun
+	runs map[string]*runRec
 }
 
-type activeRun struct {
-	run *WorkflowRun
+type runRec struct {
+	run  *WorkflowRun
+	jl   *jsonl
+	path string
+	done chan struct{}
 
 	mu       sync.Mutex
 	pauseReq bool
@@ -44,8 +47,10 @@ type activeRun struct {
 }
 
 type StartRequest struct {
-	WorkflowID  string `json:"workflowId"`
-	ProjectPath string `json:"projectPath"`
+	WorkflowID         string              `json:"workflowId"`
+	ProjectPath        string              `json:"projectPath,omitempty"` // empty → Workflow.defaultProject
+	InputOverrides     map[string]string   `json:"inputOverrides,omitempty"`     // "stepId.inputName" → value
+	ArgumentOverrides  map[string][]string `json:"argumentOverrides,omitempty"`  // processId → args
 }
 
 type WorkflowRun struct {
@@ -65,10 +70,11 @@ type Connection struct {
 
 // Workflow is the Engine-facing definition view (Connections derived on read).
 type Workflow struct {
-	ID          string       `json:"id"`
-	Name        string       `json:"name"`
-	Steps       []StepView   `json:"steps"`
-	Connections []Connection `json:"connections"`
+	ID             string       `json:"id"`
+	Name           string       `json:"name"`
+	DefaultProject string       `json:"defaultProject,omitempty"`
+	Steps          []StepView   `json:"steps"`
+	Connections    []Connection `json:"connections"`
 }
 
 type StepView struct {
@@ -95,9 +101,10 @@ type SourceView struct {
 }
 
 type workflowDef struct {
-	ID    string    `yaml:"id"`
-	Name  string    `yaml:"name"`
-	Steps []stepDef `yaml:"steps"`
+	ID             string    `yaml:"id"`
+	Name           string    `yaml:"name"`
+	DefaultProject string    `yaml:"defaultProject"`
+	Steps          []stepDef `yaml:"steps"`
 }
 
 type stepDef struct {
@@ -111,6 +118,7 @@ type stepDef struct {
 
 type inputDef struct {
 	Name   string     `yaml:"name"`
+	Value  string     `yaml:"value"`
 	Source *sourceDef `yaml:"source"`
 }
 
@@ -155,7 +163,7 @@ type existsPred struct {
 }
 
 func New(cfg Config) *Engine {
-	return &Engine{cfg: cfg, runs: map[string]*activeRun{}}
+	return &Engine{cfg: cfg, runs: map[string]*runRec{}}
 }
 
 func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
@@ -163,7 +171,14 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 	if err != nil {
 		return nil, err
 	}
-	project, err := filepath.Abs(req.ProjectPath)
+	projectPath := req.ProjectPath
+	if projectPath == "" {
+		projectPath = wf.DefaultProject
+	}
+	if projectPath == "" {
+		return nil, fmt.Errorf("project path required (no Workflow defaultProject)")
+	}
+	project, err := filepath.Abs(projectPath)
 	if err != nil {
 		return nil, err
 	}
@@ -174,121 +189,47 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 		ProjectPath: project,
 		Status:      StatusRunning,
 	}
-	ar := &activeRun{run: run, resumeCh: make(chan struct{})}
-	e.mu.Lock()
-	e.runs[id] = ar
-	e.mu.Unlock()
-
 	runDir := filepath.Join(e.cfg.StorageRoot, filepath.Base(project), id)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return nil, err
 	}
-	jl, err := openJSONL(filepath.Join(runDir, "events.jsonl"))
+	jsonlPath := filepath.Join(runDir, "events.jsonl")
+	jl, err := openJSONL(jsonlPath)
 	if err != nil {
 		return nil, err
 	}
+	rec := &runRec{run: run, jl: jl, path: jsonlPath, done: make(chan struct{}), resumeCh: make(chan struct{})}
+	e.mu.Lock()
+	e.runs[id] = rec
+	e.mu.Unlock()
 
-	go e.execute(ar, wf, project, jl)
+	go e.execute(rec, wf, project, req)
+
 	cp := *run
 	return &cp, nil
 }
 
-func (e *Engine) Get(id string) (*WorkflowRun, error) {
-	ar, err := e.getActive(id)
-	if err != nil {
-		return nil, err
-	}
-	ar.mu.Lock()
-	defer ar.mu.Unlock()
-	cp := *ar.run
-	return &cp, nil
-}
+func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req StartRequest) {
+	defer func() {
+		_ = rec.jl.Close()
+		close(rec.done)
+	}()
+	jl := rec.jl
+	run := rec.run
 
-func (e *Engine) Pause(id string) error {
-	ar, err := e.getActive(id)
-	if err != nil {
-		return err
-	}
-	ar.mu.Lock()
-	defer ar.mu.Unlock()
-	if ar.stopped {
-		return fmt.Errorf("WorkflowRun %q is stopped", id)
-	}
-	ar.pauseReq = true
-	return nil
-}
-
-func (e *Engine) Resume(id string) error {
-	ar, err := e.getActive(id)
-	if err != nil {
-		return err
-	}
-	ar.mu.Lock()
-	defer ar.mu.Unlock()
-	if ar.run.Status != StatusPaused {
-		return fmt.Errorf("WorkflowRun %q is not paused", id)
-	}
-	ar.pauseReq = false
-	ar.run.Status = StatusRunning
-	select {
-	case ar.resumeCh <- struct{}{}:
-	default:
-	}
-	return nil
-}
-
-func (e *Engine) Stop(id string) error {
-	ar, err := e.getActive(id)
-	if err != nil {
-		return err
-	}
-	ar.mu.Lock()
-	ar.stopped = true
-	ar.pauseReq = false
-	cmd := ar.cmd
-	if ar.run.Status == StatusPaused {
-		select {
-		case ar.resumeCh <- struct{}{}:
-		default:
-		}
-	}
-	ar.mu.Unlock()
-	sigterm(cmd)
-	return nil
-}
-
-func sigterm(cmd *exec.Cmd) {
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-}
-
-func (e *Engine) getActive(id string) (*activeRun, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	ar, ok := e.runs[id]
-	if !ok {
-		return nil, fmt.Errorf("WorkflowRun %q not found", id)
-	}
-	return ar, nil
-}
-
-func (e *Engine) execute(ar *activeRun, wf *workflowDef, project string, jl *jsonl) {
-	defer jl.Close()
-	_ = jl.Append(map[string]any{"type": "workflow_started", "workflowId": wf.ID, "runId": ar.run.ID})
+	_ = jl.Append(map[string]any{"type": "workflow_started", "workflowId": wf.ID, "runId": run.ID})
 
 	outputs := map[string]map[string]string{}
 
 	for _, step := range wf.Steps {
-		if ar.isStopped() {
-			_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": ar.run.ID})
-			ar.setStatus(StatusStopped)
+		if rec.isStopped() {
+			rec.setStatus(StatusStopped)
+			_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": run.ID})
 			return
 		}
-		if err := ar.waitIfPaused(); err != nil {
-			_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": ar.run.ID})
-			ar.setStatus(StatusStopped)
+		if err := rec.waitIfPaused(); err != nil {
+			rec.setStatus(StatusStopped)
+			_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": run.ID})
 			return
 		}
 
@@ -296,28 +237,28 @@ func (e *Engine) execute(ar *activeRun, wf *workflowDef, project string, jl *jso
 		if mode == "" {
 			mode = "series"
 		}
-		inputs, env, err := resolveInputs(step, outputs)
+		inputs, env, err := resolveInputs(step, outputs, req.InputOverrides)
 		if err != nil {
-			ar.setStatus(StatusFailed)
+			rec.setStatus(StatusFailed)
 			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
 			return
 		}
 		_ = jl.Append(map[string]any{"type": "step_started", "stepId": step.ID, "mode": mode})
 		switch mode {
 		case "series":
-			err = e.runSeries(ar, project, step, env, jl)
+			err = e.runSeries(rec, project, step, env, req.ArgumentOverrides, jl)
 		case "decision":
-			err = e.runDecision(ar, project, step, inputs, env, jl)
+			err = e.runDecision(rec, project, step, inputs, env, req.ArgumentOverrides, jl)
 		default:
 			err = fmt.Errorf("unsupported mode %q", mode)
 		}
 		if err != nil {
-			if ar.isStopped() {
-				_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": ar.run.ID})
-				ar.setStatus(StatusStopped)
+			if rec.isStopped() {
+				rec.setStatus(StatusStopped)
+				_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": run.ID})
 				return
 			}
-			ar.setStatus(StatusFailed)
+			rec.setStatus(StatusFailed)
 			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
 			return
 		}
@@ -328,53 +269,181 @@ func (e *Engine) execute(ar *activeRun, wf *workflowDef, project string, jl *jso
 		outputs[step.ID] = stepOut
 		_ = jl.Append(map[string]any{"type": "step_succeeded", "stepId": step.ID})
 
-		if err := ar.waitIfPaused(); err != nil {
-			_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": ar.run.ID})
-			ar.setStatus(StatusStopped)
+		if err := rec.waitIfPaused(); err != nil {
+			rec.setStatus(StatusStopped)
+			_ = jl.Append(map[string]any{"type": "workflow_stopped", "runId": run.ID})
 			return
 		}
 	}
 
-	ar.setStatus(StatusSucceeded)
-	_ = jl.Append(map[string]any{"type": "workflow_succeeded", "runId": ar.run.ID})
+	rec.setStatus(StatusSucceeded)
+	_ = jl.Append(map[string]any{"type": "workflow_succeeded", "runId": run.ID})
 }
 
-func (ar *activeRun) setStatus(status string) {
-	ar.mu.Lock()
-	ar.run.Status = status
-	ar.mu.Unlock()
+func (e *Engine) Get(id string) (*WorkflowRun, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	rec, ok := e.runs[id]
+	if !ok {
+		return nil, fmt.Errorf("WorkflowRun %q not found", id)
+	}
+	rec.mu.Lock()
+	cp := *rec.run
+	rec.mu.Unlock()
+	return &cp, nil
 }
 
-func (ar *activeRun) isStopped() bool {
-	ar.mu.Lock()
-	defer ar.mu.Unlock()
-	return ar.stopped
+func (e *Engine) Pause(id string) error {
+	rec, err := e.getRec(id)
+	if err != nil {
+		return err
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.stopped {
+		return fmt.Errorf("WorkflowRun %q is stopped", id)
+	}
+	rec.pauseReq = true
+	return nil
 }
 
-func (ar *activeRun) waitIfPaused() error {
-	ar.mu.Lock()
-	if ar.stopped {
-		ar.mu.Unlock()
+func (e *Engine) Resume(id string) error {
+	rec, err := e.getRec(id)
+	if err != nil {
+		return err
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.run.Status != StatusPaused {
+		return fmt.Errorf("WorkflowRun %q is not paused", id)
+	}
+	rec.pauseReq = false
+	rec.run.Status = StatusRunning
+	select {
+	case rec.resumeCh <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (e *Engine) Stop(id string) error {
+	rec, err := e.getRec(id)
+	if err != nil {
+		return err
+	}
+	rec.mu.Lock()
+	rec.stopped = true
+	rec.pauseReq = false
+	cmd := rec.cmd
+	if rec.run.Status == StatusPaused {
+		select {
+		case rec.resumeCh <- struct{}{}:
+		default:
+		}
+	}
+	rec.mu.Unlock()
+	sigterm(cmd)
+	return nil
+}
+
+func (e *Engine) getRec(id string) (*runRec, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	rec, ok := e.runs[id]
+	if !ok {
+		return nil, fmt.Errorf("WorkflowRun %q not found", id)
+	}
+	return rec, nil
+}
+
+func (rec *runRec) setStatus(status string) {
+	rec.mu.Lock()
+	rec.run.Status = status
+	rec.mu.Unlock()
+}
+
+func (rec *runRec) isStopped() bool {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return rec.stopped
+}
+
+func (rec *runRec) waitIfPaused() error {
+	rec.mu.Lock()
+	if rec.stopped {
+		rec.mu.Unlock()
 		return fmt.Errorf("stopped")
 	}
-	if !ar.pauseReq {
-		ar.mu.Unlock()
+	if !rec.pauseReq {
+		rec.mu.Unlock()
 		return nil
 	}
-	ar.run.Status = StatusPaused
-	ch := ar.resumeCh
-	ar.mu.Unlock()
+	rec.run.Status = StatusPaused
+	ch := rec.resumeCh
+	rec.mu.Unlock()
 	<-ch
-	ar.mu.Lock()
-	stopped := ar.stopped
+	rec.mu.Lock()
+	stopped := rec.stopped
 	if !stopped {
-		ar.run.Status = StatusRunning
+		rec.run.Status = StatusRunning
 	}
-	ar.mu.Unlock()
+	rec.mu.Unlock()
 	if stopped {
 		return fmt.Errorf("stopped")
 	}
 	return nil
+}
+
+func sigterm(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+}
+
+// Follow sends JSONL history then live appends (same map shape as the file).
+// The channel closes when the run finishes (or immediately after history if already done).
+func (e *Engine) Follow(id string) (<-chan map[string]any, func(), error) {
+	e.mu.Lock()
+	rec, ok := e.runs[id]
+	e.mu.Unlock()
+	if !ok {
+		return nil, nil, fmt.Errorf("WorkflowRun %q not found", id)
+	}
+
+	out := make(chan map[string]any, 256)
+	stop := make(chan struct{})
+	var once sync.Once
+	cancel := func() { once.Do(func() { close(stop) }) }
+
+	go func() {
+		defer close(out)
+		hist, live, unsub := rec.jl.Subscribe()
+		defer unsub()
+		for _, ev := range hist {
+			select {
+			case out <- ev:
+			case <-stop:
+				return
+			}
+		}
+		for {
+			select {
+			case ev, ok := <-live:
+				if !ok {
+					return
+				}
+				select {
+				case out <- ev:
+				case <-stop:
+					return
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return out, cancel, nil
 }
 
 func (e *Engine) GetWorkflow(id string) (*Workflow, error) {
@@ -386,7 +455,7 @@ func (e *Engine) GetWorkflow(id string) (*Workflow, error) {
 }
 
 func toWorkflowView(wf *workflowDef) *Workflow {
-	out := &Workflow{ID: wf.ID, Name: wf.Name}
+	out := &Workflow{ID: wf.ID, Name: wf.Name, DefaultProject: wf.DefaultProject}
 	for _, s := range wf.Steps {
 		sv := StepView{ID: s.ID, Name: s.Name, Mode: s.Mode}
 		for _, in := range s.Inputs {
@@ -418,23 +487,33 @@ func toWorkflowView(wf *workflowDef) *Workflow {
 	return out
 }
 
-func resolveInputs(step stepDef, outputs map[string]map[string]string) (map[string]string, []string, error) {
+func resolveInputs(step stepDef, outputs map[string]map[string]string, overrides map[string]string) (map[string]string, []string, error) {
 	inputs := map[string]string{}
 	var env []string
 	for _, in := range step.Inputs {
-		if in.Source == nil {
+		key := step.ID + "." + in.Name
+		if ov, ok := overrides[key]; ok {
+			inputs[in.Name] = ov
+			env = append(env, fmt.Sprintf("SUBSPACE_INPUT_%s=%s", in.Name, ov))
 			continue
 		}
-		stepOut, ok := outputs[in.Source.StepID]
-		if !ok {
-			return nil, nil, fmt.Errorf("input %q: step %q has no outputs yet", in.Name, in.Source.StepID)
+		if in.Source != nil {
+			stepOut, ok := outputs[in.Source.StepID]
+			if !ok {
+				return nil, nil, fmt.Errorf("input %q: step %q has no outputs yet", in.Name, in.Source.StepID)
+			}
+			val, ok := stepOut[in.Source.Output]
+			if !ok {
+				return nil, nil, fmt.Errorf("input %q: output %q.%q not found", in.Name, in.Source.StepID, in.Source.Output)
+			}
+			inputs[in.Name] = val
+			env = append(env, fmt.Sprintf("SUBSPACE_INPUT_%s=%s", in.Name, val))
+			continue
 		}
-		val, ok := stepOut[in.Source.Output]
-		if !ok {
-			return nil, nil, fmt.Errorf("input %q: output %q.%q not found", in.Name, in.Source.StepID, in.Source.Output)
+		if in.Value != "" {
+			inputs[in.Name] = in.Value
+			env = append(env, fmt.Sprintf("SUBSPACE_INPUT_%s=%s", in.Name, in.Value))
 		}
-		inputs[in.Name] = val
-		env = append(env, fmt.Sprintf("SUBSPACE_INPUT_%s=%s", in.Name, val))
 	}
 	return inputs, env, nil
 }
@@ -455,19 +534,19 @@ func (e *Engine) loadWorkflow(id string) (*workflowDef, error) {
 	return &wf, nil
 }
 
-func (e *Engine) runSeries(ar *activeRun, project string, step stepDef, env []string, jl *jsonl) error {
+func (e *Engine) runSeries(rec *runRec, project string, step stepDef, env []string, argOverrides map[string][]string, jl *jsonl) error {
 	for _, p := range step.Processes {
-		if ar.isStopped() {
+		if rec.isStopped() {
 			return fmt.Errorf("stopped")
 		}
-		if err := e.runProcess(ar, project, p, env, jl); err != nil {
+		if err := e.runProcess(rec, project, p, env, argOverrides, jl); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (e *Engine) runDecision(ar *activeRun, project string, step stepDef, inputs map[string]string, env []string, jl *jsonl) error {
+func (e *Engine) runDecision(rec *runRec, project string, step stepDef, inputs map[string]string, env []string, argOverrides map[string][]string, jl *jsonl) error {
 	var matched []processDef
 	for _, p := range step.Processes {
 		ok, err := predicateMatches(p.When, inputs)
@@ -488,7 +567,7 @@ func (e *Engine) runDecision(ar *activeRun, project string, step stepDef, inputs
 		}
 		return fmt.Errorf("decision step %q: multiple processes matched: %v", step.ID, ids)
 	}
-	return e.runProcess(ar, project, matched[0], env, jl)
+	return e.runProcess(rec, project, matched[0], env, argOverrides, jl)
 }
 
 func predicateMatches(p *predicateDef, inputs map[string]string) (bool, error) {
@@ -529,7 +608,7 @@ func predicateMatches(p *predicateDef, inputs map[string]string) (bool, error) {
 	}
 }
 
-func (e *Engine) runProcess(ar *activeRun, project string, p processDef, env []string, jl *jsonl) error {
+func (e *Engine) runProcess(rec *runRec, project string, p processDef, env []string, argOverrides map[string][]string, jl *jsonl) error {
 	_ = jl.Append(map[string]any{"type": "process_started", "processId": p.ID, "command": p.Command})
 
 	cwd := project
@@ -541,7 +620,11 @@ func (e *Engine) runProcess(ar *activeRun, project string, p processDef, env []s
 		}
 	}
 
-	cmd := exec.Command(p.Command, p.Arguments...)
+	args := p.Arguments
+	if ov, ok := argOverrides[p.ID]; ok {
+		args = ov
+	}
+	cmd := exec.Command(p.Command, args...)
 	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if len(env) > 0 {
@@ -560,10 +643,10 @@ func (e *Engine) runProcess(ar *activeRun, project string, p processDef, env []s
 		return err
 	}
 
-	ar.mu.Lock()
-	ar.cmd = cmd
-	stopped := ar.stopped
-	ar.mu.Unlock()
+	rec.mu.Lock()
+	rec.cmd = cmd
+	stopped := rec.stopped
+	rec.mu.Unlock()
 	if stopped {
 		sigterm(cmd)
 	}
@@ -575,10 +658,10 @@ func (e *Engine) runProcess(ar *activeRun, project string, p processDef, env []s
 	wg.Wait()
 
 	err = cmd.Wait()
-	ar.mu.Lock()
-	ar.cmd = nil
-	stopped = ar.stopped
-	ar.mu.Unlock()
+	rec.mu.Lock()
+	rec.cmd = nil
+	stopped = rec.stopped
+	rec.mu.Unlock()
 	if stopped {
 		_ = jl.Append(map[string]any{"type": "process_stopped", "processId": p.ID})
 		return fmt.Errorf("stopped")
