@@ -16,12 +16,40 @@ type WorkflowRun = {
   processRuns?: ProcessRun[];
 };
 
+type Connection = {
+  sourceStepId: string;
+  sourceOutput: string;
+  targetStepId: string;
+  targetInput: string;
+};
+
+type Workflow = {
+  id: string;
+  name: string;
+  connections: Connection[];
+};
+
 export default function App() {
-  const [workflowId, setWorkflowId] = useState("series-hello");
+  const [workflowId, setWorkflowId] = useState("pipe");
   const [projectPath, setProjectPath] = useState("");
   const [run, setRun] = useState<WorkflowRun | null>(null);
+  const [workflow, setWorkflow] = useState<Workflow | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+
+  async function loadWiring() {
+    setBusy(true);
+    setError("");
+    try {
+      const res = await fetch(`${API}/api/workflows/${workflowId}`);
+      if (!res.ok) throw new Error(await res.text());
+      setWorkflow(await res.json());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function start() {
     setBusy(true);
@@ -68,7 +96,10 @@ export default function App() {
         Project path
         <input value={projectPath} onChange={(e) => setProjectPath(e.target.value)} style={{ display: "block", width: "100%" }} />
       </label>
-      <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+      <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <button disabled={busy} onClick={loadWiring}>
+          Show wiring
+        </button>
         <button disabled={busy || !projectPath} onClick={start}>
           Start run
         </button>
@@ -77,6 +108,22 @@ export default function App() {
         </button>
       </div>
       {error && <p style={{ color: "crimson" }}>{error}</p>}
+      {workflow && (
+        <section style={{ marginTop: 16 }}>
+          <h2 style={{ fontSize: "1rem" }}>Wiring ({workflow.id})</h2>
+          {workflow.connections.length === 0 ? (
+            <p>No connections</p>
+          ) : (
+            <ul>
+              {workflow.connections.map((c, i) => (
+                <li key={i}>
+                  {c.sourceStepId}.{c.sourceOutput} → {c.targetStepId}.{c.targetInput}
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
       {run && (
         <pre style={{ background: "#f4f4f4", padding: 12, marginTop: 16 }}>
           {JSON.stringify(run, null, 2)}
