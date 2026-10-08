@@ -579,3 +579,175 @@ func chmodX(t *testing.T, p string) {
 		t.Fatal(err)
 	}
 }
+
+func TestWorkflowDefaultProjectWhenNoOverride(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "default-proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(project, "ok.sh"), "#!/bin/sh\necho ran\n")
+	chmodX(t, filepath.Join(project, "ok.sh"))
+
+	writeFile(t, filepath.Join(workflows, "with-default.yaml"), `
+id: with-default
+name: With Default
+defaultProject: `+project+`
+steps:
+  - id: one
+    mode: series
+    processes:
+      - id: ok
+        command: ./ok.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{WorkflowID: "with-default"})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if run.Status != engine.StatusSucceeded {
+		t.Fatalf("status=%s want succeeded", run.Status)
+	}
+	abs, _ := filepath.Abs(project)
+	if run.ProjectPath != abs {
+		t.Fatalf("ProjectPath=%q want %q", run.ProjectPath, abs)
+	}
+}
+
+func TestStartTimeProjectOverrideWins(t *testing.T) {
+	root := t.TempDir()
+	defaultProj := filepath.Join(root, "default-proj")
+	overrideProj := filepath.Join(root, "override-proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, defaultProj)
+	mustMkdir(t, overrideProj)
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(defaultProj, "ok.sh"), "#!/bin/sh\necho default\n")
+	chmodX(t, filepath.Join(defaultProj, "ok.sh"))
+	writeFile(t, filepath.Join(overrideProj, "ok.sh"), "#!/bin/sh\necho override > marker\n")
+	chmodX(t, filepath.Join(overrideProj, "ok.sh"))
+
+	writeFile(t, filepath.Join(workflows, "with-default.yaml"), `
+id: with-default
+defaultProject: `+defaultProj+`
+steps:
+  - id: one
+    mode: series
+    processes:
+      - id: ok
+        command: ./ok.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{
+		WorkflowID:  "with-default",
+		ProjectPath: overrideProj,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if run.Status != engine.StatusSucceeded {
+		t.Fatalf("status=%s", run.Status)
+	}
+	abs, _ := filepath.Abs(overrideProj)
+	if run.ProjectPath != abs {
+		t.Fatalf("ProjectPath=%q want %q", run.ProjectPath, abs)
+	}
+	if _, err := os.Stat(filepath.Join(overrideProj, "marker")); err != nil {
+		t.Fatalf("override project script did not run: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(defaultProj, "marker")); err == nil {
+		t.Fatal("default project should not have been used")
+	}
+}
+
+func TestPerRunInputOverride(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(project, "check.sh"), `#!/bin/sh
+test "$SUBSPACE_INPUT_msg" = "from-override" || { echo "got=$SUBSPACE_INPUT_msg" >&2; exit 1; }
+echo ok
+`)
+	chmodX(t, filepath.Join(project, "check.sh"))
+
+	writeFile(t, filepath.Join(workflows, "lit.yaml"), `
+id: lit
+steps:
+  - id: use
+    mode: series
+    inputs:
+      - name: msg
+        value: from-yaml
+    processes:
+      - id: check
+        command: ./check.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{
+		WorkflowID:  "lit",
+		ProjectPath: project,
+		InputOverrides: map[string]string{"use.msg": "from-override"},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if run.Status != engine.StatusSucceeded {
+		t.Fatalf("status=%s want succeeded", run.Status)
+	}
+}
+
+func TestPerRunArgumentOverride(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(project, "echo.sh"), `#!/bin/sh
+printf '%s\n' "$@" > out.txt
+`)
+	chmodX(t, filepath.Join(project, "echo.sh"))
+
+	writeFile(t, filepath.Join(workflows, "args.yaml"), `
+id: args
+steps:
+  - id: one
+    mode: series
+    processes:
+      - id: echo
+        command: ./echo.sh
+        arguments: ["yaml-arg"]
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{
+		WorkflowID:  "args",
+		ProjectPath: project,
+		ArgumentOverrides: map[string][]string{"echo": {"override-arg"}},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if run.Status != engine.StatusSucceeded {
+		t.Fatalf("status=%s", run.Status)
+	}
+	got, err := os.ReadFile(filepath.Join(project, "out.txt"))
+	if err != nil {
+		t.Fatalf("read out: %v", err)
+	}
+	if strings.TrimSpace(string(got)) != "override-arg" {
+		t.Fatalf("args=%q want override-arg", got)
+	}
+}
