@@ -19,27 +19,18 @@ func main() {
 	}
 
 	addr := flag.String("addr", ":4201", "HTTP listen address")
-	workflows := flag.String("workflows", "", "workflows directory (default: SUBSPACE_HOME/workflows or ./workflows)")
 	storage := flag.String("storage", "", "Subspace home / run storage root (default: SUBSPACE_HOME or ~/.local/subspace)")
 	flag.Parse()
 
-	wfDir := *workflows
-	if wfDir == "" {
-		if home := os.Getenv("SUBSPACE_HOME"); home != "" {
-			wfDir = filepath.Join(home, "workflows")
-		} else {
-			wd, _ := os.Getwd()
-			wfDir = filepath.Join(wd, "workflows")
-		}
-	}
 	store := *storage
 	if store == "" {
 		store = subspaceHome()
 	}
 
-	eng := engine.New(engine.Config{WorkflowsDir: wfDir, StorageRoot: store})
+	// Workflows load from StorageRoot/<repo>/workflows only (not monorepo ./workflows).
+	eng := engine.New(engine.Config{StorageRoot: store})
 	srv := &api.Server{Eng: eng, Home: store}
-	fmt.Printf("subspace listening on %s (workflows=%s storage=%s)\n", *addr, wfDir, store)
+	fmt.Printf("subspace listening on %s (storage=%s)\n", *addr, store)
 	log.Fatal(http.ListenAndServe(*addr, srv.Handler()))
 }
 

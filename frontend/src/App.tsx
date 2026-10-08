@@ -13,6 +13,34 @@ function wsURL(path: string) {
   return `${API_BASE.replace(/^http/, "ws")}${path}`;
 }
 
+/** Parse "step.input=value" lines into InputOverrides. */
+function parseInputOverrides(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    const i = t.indexOf("=");
+    if (i <= 0) continue;
+    out[t.slice(0, i)] = t.slice(i + 1);
+  }
+  return out;
+}
+
+/** Parse "processId=arg1,arg2" lines into ArgumentOverrides. */
+function parseArgOverrides(text: string): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    const i = t.indexOf("=");
+    if (i <= 0) continue;
+    const id = t.slice(0, i);
+    const args = t.slice(i + 1);
+    out[id] = args === "" ? [] : args.split(",");
+  }
+  return out;
+}
+
 function deriveStepStatus(run: WorkflowRun | null, events: TimelineEvent[]): Record<string, StepStatus> {
   const out: Record<string, StepStatus> = {};
   for (const sr of run?.stepRuns ?? []) {
@@ -314,6 +342,8 @@ function WorkflowCanvas({ repo, workflowId }: { repo: string; workflowId: string
   const [workflow, setWorkflow] = useState<Workflow | null>(null);
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
+  const [inputOverrideText, setInputOverrideText] = useState("");
+  const [argOverrideText, setArgOverrideText] = useState("");
   useEffect(() => {
     void (async () => {
       const { data, error: err, response } = await api.GET("/api/workflows/{repo}/{workflowId}", {
@@ -334,9 +364,18 @@ function WorkflowCanvas({ repo, workflowId }: { repo: string; workflowId: string
   async function startRun() {
     setStarting(true);
     setError("");
+    const body: {
+      workflowId: string;
+      inputOverrides?: Record<string, string>;
+      argumentOverrides?: Record<string, string[]>;
+    } = { workflowId };
+    const inputs = parseInputOverrides(inputOverrideText);
+    if (Object.keys(inputs).length) body.inputOverrides = inputs;
+    const args = parseArgOverrides(argOverrideText);
+    if (Object.keys(args).length) body.argumentOverrides = args;
     const { data, error: err, response } = await api.POST("/api/runs/{repo}", {
       params: { path: { repo } },
-      body: { workflowId },
+      body,
     });
     setStarting(false);
     if (response?.status === 404) {
@@ -357,22 +396,47 @@ function WorkflowCanvas({ repo, workflowId }: { repo: string; workflowId: string
       </p>
       {error && <p className="debugger-error">{error}</p>}
       {workflow && (
-        <div className="debugger-canvas" style={{ minHeight: "60vh" }}>
-          <p style={{ marginBottom: "0.75rem" }}>
-            <button type="button" onClick={() => void startRun()} disabled={starting}>
-              {starting ? "Starting…" : "Start WorkflowRun"}
-            </button>
-          </p>
-          <div className="wf-canvas">
-            <Canvas
-              steps={workflow.steps}
-              connections={workflow.connections}
-              stepStatus={{}}
-            />
+        <div className="debugger-split" style={{ minHeight: "60vh" }}>
+          <div className="debugger-canvas">
+            <p style={{ marginBottom: "0.75rem" }}>
+              <button type="button" onClick={() => void startRun()} disabled={starting}>
+                {starting ? "Starting…" : "Start WorkflowRun"}
+              </button>
+            </p>
+            <div className="wf-canvas">
+              <Canvas
+                steps={workflow.steps}
+                connections={workflow.connections}
+                stepStatus={{}}
+              />
+            </div>
+            <p className="muted" style={{ marginTop: "0.75rem" }}>
+              Read-only canvas. Edit Workflow YAML on disk. Working tree is the Repo path.
+            </p>
           </div>
-          <p className="muted" style={{ marginTop: "0.75rem" }}>
-            Read-only canvas. Edit Workflow YAML on disk.
-          </p>
+          <aside className="debugger-panel">
+            <section className="panel-section">
+              <h2>Overrides</h2>
+              <label className="field">
+                Input overrides
+                <textarea
+                  value={inputOverrideText}
+                  onChange={(e) => setInputOverrideText(e.target.value)}
+                  rows={3}
+                  placeholder="step.input=value per line"
+                />
+              </label>
+              <label className="field">
+                Argument overrides
+                <textarea
+                  value={argOverrideText}
+                  onChange={(e) => setArgOverrideText(e.target.value)}
+                  rows={3}
+                  placeholder="processId=arg1,arg2 per line"
+                />
+              </label>
+            </section>
+          </aside>
         </div>
       )}
     </Shell>

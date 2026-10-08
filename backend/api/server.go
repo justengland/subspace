@@ -53,7 +53,7 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing repo", http.StatusBadRequest)
 		return
 	}
-	project, err := registry.AbsolutePath(s.Home, repo)
+	repoPath, err := registry.AbsolutePath(s.Home, repo)
 	if err != nil {
 		var nf *registry.NotFoundError
 		if errors.As(err, &nf) {
@@ -72,7 +72,7 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "workflowId required", http.StatusBadRequest)
 		return
 	}
-	run, err := s.Eng.StartInRepo(repo, project, req)
+	run, err := s.Eng.StartInRepo(repo, repoPath, req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -120,7 +120,7 @@ func (s *Server) pauseRun(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.Eng.Pause(id); err != nil {
+	if err := s.Eng.PauseInRepo(repo, id); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -132,7 +132,7 @@ func (s *Server) resumeRun(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.Eng.Resume(id); err != nil {
+	if err := s.Eng.ResumeInRepo(repo, id); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -144,7 +144,7 @@ func (s *Server) stopRun(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.Eng.Stop(id); err != nil {
+	if err := s.Eng.StopInRepo(repo, id); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -167,7 +167,7 @@ func (s *Server) rewindRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "stepId required", http.StatusBadRequest)
 		return
 	}
-	if err := s.Eng.Rewind(id, body.StepID); err != nil {
+	if err := s.Eng.RewindInRepo(repo, id, body.StepID); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -249,11 +249,11 @@ func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) followRun(w http.ResponseWriter, r *http.Request) {
-	_, id, ok := s.runPath(w, r)
+	repo, id, ok := s.runPath(w, r)
 	if !ok {
 		return
 	}
-	ch, cancel, err := s.Eng.Follow(id)
+	ch, cancel, err := s.Eng.FollowInRepo(repo, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return

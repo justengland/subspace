@@ -52,7 +52,7 @@ herdr pane run "$front_pane" \
   "cd $(printf '%q' "$ROOT/frontend") && (test -d node_modules || npm install) && env VITE_API_URL=$(printf '%q' "$API_URL") npm run dev -- --host 127.0.0.1 --port $(printf '%q' "$FRONT_PORT")"
 
 herdr pane run "$back_pane" \
-  "cd $(printf '%q' "$ROOT/backend") && go run ./cmd/subspace -addr $(printf '%q' "$ADDR") -workflows $(printf '%q' "$ROOT/workflows")"
+  "cd $(printf '%q' "$ROOT/backend") && go run ./cmd/subspace -addr $(printf '%q' "$ADDR")"
 
 printf 'frontend → pane %s (http://127.0.0.1:%s/)\n' "$front_pane" "$FRONT_PORT"
 printf 'backend  → pane %s (%s)\n' "$back_pane" "$API_URL"
