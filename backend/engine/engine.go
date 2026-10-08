@@ -27,7 +27,14 @@ type Config struct {
 type Engine struct {
 	cfg  Config
 	mu   sync.Mutex
-	runs map[string]*WorkflowRun
+	runs map[string]*runRec
+}
+
+type runRec struct {
+	run  *WorkflowRun
+	jl   *jsonl
+	path string
+	done chan struct{}
 }
 
 type StartRequest struct {
@@ -62,10 +69,10 @@ type Workflow struct {
 }
 
 type StepView struct {
-	ID      string      `json:"id"`
-	Name    string      `json:"name"`
-	Mode    string      `json:"mode"`
-	Inputs  []InputView `json:"inputs,omitempty"`
+	ID      string       `json:"id"`
+	Name    string       `json:"name"`
+	Mode    string       `json:"mode"`
+	Inputs  []InputView  `json:"inputs,omitempty"`
 	Outputs []OutputView `json:"outputs,omitempty"`
 }
 
@@ -147,7 +154,7 @@ type existsPred struct {
 }
 
 func New(cfg Config) *Engine {
-	return &Engine{cfg: cfg, runs: map[string]*WorkflowRun{}}
+	return &Engine{cfg: cfg, runs: map[string]*runRec{}}
 }
 
 func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
@@ -173,23 +180,36 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 		ProjectPath: project,
 		Status:      StatusRunning,
 	}
-	e.mu.Lock()
-	e.runs[id] = run
-	e.mu.Unlock()
-
 	runDir := filepath.Join(e.cfg.StorageRoot, filepath.Base(project), id)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return nil, err
 	}
-	jl, err := openJSONL(filepath.Join(runDir, "events.jsonl"))
+	jsonlPath := filepath.Join(runDir, "events.jsonl")
+	jl, err := openJSONL(jsonlPath)
 	if err != nil {
 		return nil, err
 	}
-	defer jl.Close()
+	rec := &runRec{run: run, jl: jl, path: jsonlPath, done: make(chan struct{})}
+	e.mu.Lock()
+	e.runs[id] = rec
+	e.mu.Unlock()
 
-	_ = jl.Append(map[string]any{"type": "workflow_started", "workflowId": wf.ID, "runId": id})
+	go e.execute(rec, wf, project, req)
 
-	// stepID -> outputName -> value (populated as Steps complete)
+	cp := *run
+	return &cp, nil
+}
+
+func (e *Engine) execute(rec *runRec, wf *workflowDef, project string, req StartRequest) {
+	defer func() {
+		_ = rec.jl.Close()
+		close(rec.done)
+	}()
+	jl := rec.jl
+	run := rec.run
+
+	_ = jl.Append(map[string]any{"type": "workflow_started", "workflowId": wf.ID, "runId": run.ID})
+
 	outputs := map[string]map[string]string{}
 
 	for _, step := range wf.Steps {
@@ -201,7 +221,7 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 		if err != nil {
 			run.Status = StatusFailed
 			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
-			return run, nil
+			return
 		}
 		_ = jl.Append(map[string]any{"type": "step_started", "stepId": step.ID, "mode": mode})
 		switch mode {
@@ -215,7 +235,7 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 		if err != nil {
 			run.Status = StatusFailed
 			_ = jl.Append(map[string]any{"type": "workflow_failed", "error": err.Error()})
-			return run, nil
+			return
 		}
 		stepOut := map[string]string{}
 		for _, o := range step.Outputs {
@@ -226,19 +246,63 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 	}
 
 	run.Status = StatusSucceeded
-	_ = jl.Append(map[string]any{"type": "workflow_succeeded", "runId": id})
-	return run, nil
+	_ = jl.Append(map[string]any{"type": "workflow_succeeded", "runId": run.ID})
 }
 
 func (e *Engine) Get(id string) (*WorkflowRun, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	run, ok := e.runs[id]
+	rec, ok := e.runs[id]
 	if !ok {
 		return nil, fmt.Errorf("WorkflowRun %q not found", id)
 	}
-	cp := *run
+	cp := *rec.run
 	return &cp, nil
+}
+
+// Follow sends JSONL history then live appends (same map shape as the file).
+// The channel closes when the run finishes (or immediately after history if already done).
+func (e *Engine) Follow(id string) (<-chan map[string]any, func(), error) {
+	e.mu.Lock()
+	rec, ok := e.runs[id]
+	e.mu.Unlock()
+	if !ok {
+		return nil, nil, fmt.Errorf("WorkflowRun %q not found", id)
+	}
+
+	out := make(chan map[string]any, 256)
+	stop := make(chan struct{})
+	var once sync.Once
+	cancel := func() { once.Do(func() { close(stop) }) }
+
+	go func() {
+		defer close(out)
+		hist, live, unsub := rec.jl.Subscribe()
+		defer unsub()
+		for _, ev := range hist {
+			select {
+			case out <- ev:
+			case <-stop:
+				return
+			}
+		}
+		for {
+			select {
+			case ev, ok := <-live:
+				if !ok {
+					return
+				}
+				select {
+				case out <- ev:
+				case <-stop:
+					return
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return out, cancel, nil
 }
 
 func (e *Engine) GetWorkflow(id string) (*Workflow, error) {
@@ -470,7 +534,6 @@ func pipeLines(jl *jsonl, stream, processID string, r io.Reader) {
 }
 
 func shortID() string {
-	// time-sortable short id: YYYYMMDD-HHMMSS-XXXX
 	now := time.Now().UTC()
 	return fmt.Sprintf("%s-%04x", now.Format("20060102-150405"), now.Nanosecond()&0xffff)
 }

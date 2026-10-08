@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/justengland/subspace/backend/engine"
 )
@@ -18,7 +19,6 @@ func TestSeriesWorkflowSucceeds(t *testing.T) {
 	mustMkdir(t, project)
 	mustMkdir(t, workflows)
 
-	// Project scripts: series must run a then b (marker proves order).
 	writeFile(t, filepath.Join(project, "a.sh"), "#!/bin/sh\necho a-out\ntouch \"$PWD/a.done\"\n")
 	writeFile(t, filepath.Join(project, "b.sh"), "#!/bin/sh\ntest -f \"$PWD/a.done\" || exit 1\necho b-out\ntouch \"$PWD/b.done\"\n")
 	chmodX(t, filepath.Join(project, "a.sh"))
@@ -52,17 +52,11 @@ steps:
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if run.Status != engine.StatusSucceeded {
-		t.Fatalf("status=%s want succeeded", run.Status)
+	if run.Status != engine.StatusRunning {
+		t.Fatalf("status=%s want running", run.Status)
 	}
 
-	got, err := eng.Get(run.ID)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if got.Status != engine.StatusSucceeded {
-		t.Fatalf("Get status=%s", got.Status)
-	}
+	_ = waitStatus(t, eng, run.ID, engine.StatusSucceeded)
 
 	if _, err := os.Stat(filepath.Join(project, "a.done")); err != nil {
 		t.Fatalf("a.sh did not run: %v", err)
@@ -109,7 +103,6 @@ func TestInputSourceResolvesAcrossSteps(t *testing.T) {
 	mustMkdir(t, project)
 	mustMkdir(t, workflows)
 
-	// Downstream process must see resolved Input via env SUBSPACE_INPUT_<name>.
 	writeFile(t, filepath.Join(project, "check.sh"), `#!/bin/sh
 test "$SUBSPACE_INPUT_msg" = "hello-from-upstream" || { echo "got=$SUBSPACE_INPUT_msg" >&2; exit 1; }
 echo ok
@@ -144,9 +137,10 @@ steps:
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if run.Status != engine.StatusSucceeded {
-		t.Fatalf("status=%s want succeeded", run.Status)
+	if run.Status != engine.StatusRunning {
+		t.Fatalf("status=%s want running", run.Status)
 	}
+	_ = waitStatus(t, eng, run.ID, engine.StatusSucceeded)
 }
 
 func TestDecisionExactlyOneMatchRunsProcess(t *testing.T) {
@@ -200,9 +194,7 @@ steps:
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if run.Status != engine.StatusSucceeded {
-		t.Fatalf("status=%s want succeeded", run.Status)
-	}
+	_ = waitStatus(t, eng, run.ID, engine.StatusSucceeded)
 	if _, err := os.Stat(filepath.Join(project, "csv.done")); err != nil {
 		t.Fatalf("csv process did not run: %v", err)
 	}
@@ -254,9 +246,7 @@ steps:
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if run.Status != engine.StatusFailed {
-		t.Fatalf("status=%s want failed", run.Status)
-	}
+	_ = waitStatus(t, eng, run.ID, engine.StatusFailed)
 	if _, err := os.Stat(filepath.Join(project, "csv.done")); err == nil {
 		t.Fatal("csv process ran on zero-match")
 	}
@@ -313,9 +303,7 @@ steps:
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if run.Status != engine.StatusFailed {
-		t.Fatalf("status=%s want failed", run.Status)
-	}
+	_ = waitStatus(t, eng, run.ID, engine.StatusFailed)
 	if _, err := os.Stat(filepath.Join(project, "a.done")); err == nil {
 		t.Fatal("process ran on multi-match")
 	}
@@ -329,7 +317,6 @@ func TestConnectionsDerivedFromInputSource(t *testing.T) {
 	workflows := filepath.Join(root, "workflows")
 	mustMkdir(t, workflows)
 
-	// No connections[] in YAML — derived on read from Input.source only.
 	writeFile(t, filepath.Join(workflows, "pipe.yaml"), `
 id: pipe
 steps:
@@ -363,6 +350,26 @@ steps:
 	if c.SourceStepID != "produce" || c.SourceOutput != "msg" || c.TargetStepID != "consume" || c.TargetInput != "msg" {
 		t.Fatalf("connection=%+v", c)
 	}
+}
+
+func waitStatus(t *testing.T, eng *engine.Engine, id, want string) *engine.WorkflowRun {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err := eng.Get(id)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got.Status == want {
+			return got
+		}
+		if got.Status != engine.StatusRunning {
+			t.Fatalf("status=%s want %s", got.Status, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for %s", want)
+	return nil
 }
 
 func mustMkdir(t *testing.T, p string) {
@@ -414,9 +421,7 @@ steps:
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if run.Status != engine.StatusSucceeded {
-		t.Fatalf("status=%s want succeeded", run.Status)
-	}
+	run = waitStatus(t, eng, run.ID, engine.StatusSucceeded)
 	abs, _ := filepath.Abs(project)
 	if run.ProjectPath != abs {
 		t.Fatalf("ProjectPath=%q want %q", run.ProjectPath, abs)
@@ -457,9 +462,7 @@ steps:
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if run.Status != engine.StatusSucceeded {
-		t.Fatalf("status=%s", run.Status)
-	}
+	run = waitStatus(t, eng, run.ID, engine.StatusSucceeded)
 	abs, _ := filepath.Abs(overrideProj)
 	if run.ProjectPath != abs {
 		t.Fatalf("ProjectPath=%q want %q", run.ProjectPath, abs)
@@ -508,9 +511,7 @@ steps:
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if run.Status != engine.StatusSucceeded {
-		t.Fatalf("status=%s want succeeded", run.Status)
-	}
+	_ = waitStatus(t, eng, run.ID, engine.StatusSucceeded)
 }
 
 func TestPerRunArgumentOverride(t *testing.T) {
@@ -546,9 +547,7 @@ steps:
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if run.Status != engine.StatusSucceeded {
-		t.Fatalf("status=%s", run.Status)
-	}
+	_ = waitStatus(t, eng, run.ID, engine.StatusSucceeded)
 	got, err := os.ReadFile(filepath.Join(project, "out.txt"))
 	if err != nil {
 		t.Fatalf("read out: %v", err)

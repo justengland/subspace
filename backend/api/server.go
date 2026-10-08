@@ -3,8 +3,8 @@ package api
 import (
 	"encoding/json"
 	"net/http"
-	"strings"
 
+	"github.com/gorilla/websocket"
 	"github.com/justengland/subspace/backend/engine"
 )
 
@@ -12,11 +12,16 @@ type Server struct {
 	Eng *engine.Engine
 }
 
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(*http.Request) bool { return true },
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/runs", s.startRun)
-	mux.HandleFunc("GET /api/runs/", s.getRun)
-	mux.HandleFunc("GET /api/workflows/", s.getWorkflow)
+	mux.HandleFunc("GET /api/runs/{id}/events", s.followRun)
+	mux.HandleFunc("GET /api/runs/{id}", s.getRun)
+	mux.HandleFunc("GET /api/workflows/{id}", s.getWorkflow)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -38,7 +43,7 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/api/runs/")
+	id := r.PathValue("id")
 	if id == "" {
 		http.Error(w, "missing id", http.StatusBadRequest)
 		return
@@ -52,7 +57,7 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/api/workflows/")
+	id := r.PathValue("id")
 	if id == "" {
 		http.Error(w, "missing id", http.StatusBadRequest)
 		return
@@ -63,6 +68,28 @@ func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, wf)
+}
+
+func (s *Server) followRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ch, cancel, err := s.Eng.Follow(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	defer cancel()
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	for ev := range ch {
+		if err := conn.WriteJSON(ev); err != nil {
+			return
+		}
+	}
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
