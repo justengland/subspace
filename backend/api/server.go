@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/gorilla/websocket"
@@ -20,10 +21,11 @@ var upgrader = websocket.Upgrader{
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/runs", s.startRun)
-	mux.HandleFunc("GET /api/runs", s.listRuns)
+	mux.HandleFunc("POST /api/runs/{repo}", s.startRun)
+	mux.HandleFunc("GET /api/runs/{repo}", s.listRuns)
+	mux.HandleFunc("GET /api/runs/{repo}/{runId}", s.getRun)
+	// ponytail: flat control routes until #20 nests debugger APIs
 	mux.HandleFunc("GET /api/runs/{id}/events", s.followRun)
-	mux.HandleFunc("GET /api/runs/{id}", s.getRun)
 	mux.HandleFunc("POST /api/runs/{id}/pause", s.pauseRun)
 	mux.HandleFunc("POST /api/runs/{id}/resume", s.resumeRun)
 	mux.HandleFunc("POST /api/runs/{id}/stop", s.stopRun)
@@ -47,12 +49,31 @@ func (s *Server) listRepos(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
+	repo := r.PathValue("repo")
+	if repo == "" {
+		http.Error(w, "missing repo", http.StatusBadRequest)
+		return
+	}
+	project, err := registry.AbsolutePath(s.Home, repo)
+	if err != nil {
+		var nf *registry.NotFoundError
+		if errors.As(err, &nf) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	var req engine.StartRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	run, err := s.Eng.Start(req)
+	if req.WorkflowID == "" {
+		http.Error(w, "workflowId required", http.StatusBadRequest)
+		return
+	}
+	run, err := s.Eng.StartInRepo(repo, project, req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -61,21 +82,33 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
-	runs, err := s.Eng.List(r.URL.Query().Get("projectPath"))
+	repo := r.PathValue("repo")
+	if repo == "" {
+		http.Error(w, "missing repo", http.StatusBadRequest)
+		return
+	}
+	if !s.requireRepo(w, repo) {
+		return
+	}
+	runs, err := s.Eng.ListInRepo(repo)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusOK, runs)
 }
 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
+	repo := r.PathValue("repo")
+	id := r.PathValue("runId")
+	if repo == "" || id == "" {
+		http.Error(w, "missing repo or runId", http.StatusBadRequest)
 		return
 	}
-	run, err := s.Eng.Get(id)
+	if !s.requireRepo(w, repo) {
+		return
+	}
+	run, err := s.Eng.GetInRepo(repo, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return

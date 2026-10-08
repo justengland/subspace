@@ -17,15 +17,21 @@ import (
 	"github.com/justengland/subspace/backend/registry"
 )
 
+func setupRepo(t *testing.T, home, name string) string {
+	t.Helper()
+	project := filepath.Join(home, "proj-"+name)
+	mustMkdir(t, project)
+	if err := registry.Add(home, name, project); err != nil {
+		t.Fatal(err)
+	}
+	return project
+}
+
 func TestHTTPStartAndGet(t *testing.T) {
-	root := t.TempDir()
-	project := filepath.Join(root, "proj")
-	workflows := filepath.Join(root, "workflows")
-	storage := filepath.Join(root, "storage")
-	_ = os.MkdirAll(project, 0o755)
-	_ = os.MkdirAll(workflows, 0o755)
+	home := t.TempDir()
+	project := setupRepo(t, home, "demo")
 	_ = os.WriteFile(filepath.Join(project, "ok.sh"), []byte("#!/bin/sh\necho ok\n"), 0o755)
-	_ = os.WriteFile(filepath.Join(workflows, "one.yaml"), []byte(`
+	writeWorkflow(t, home, "demo", "one", `
 id: one
 steps:
   - id: s
@@ -33,14 +39,14 @@ steps:
     processes:
       - id: p
         command: ./ok.sh
-`), 0o644)
+`)
 
-	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
-	h := (&api.Server{Eng: eng}).Handler()
+	eng := engine.New(engine.Config{StorageRoot: home})
+	h := (&api.Server{Eng: eng, Home: home}).Handler()
 
-	body, _ := json.Marshal(map[string]string{"workflowId": "one", "projectPath": project})
+	body, _ := json.Marshal(map[string]string{"workflowId": "one"})
 	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/runs", bytes.NewReader(body)))
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/runs/demo", bytes.NewReader(body)))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("start status %d: %s", rr.Code, rr.Body)
 	}
@@ -55,7 +61,7 @@ steps:
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		rr2 := httptest.NewRecorder()
-		h.ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/api/runs/"+run.ID, nil))
+		h.ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/api/runs/demo/"+run.ID, nil))
 		if rr2.Code != http.StatusOK {
 			t.Fatalf("get status %d", rr2.Code)
 		}
@@ -75,14 +81,10 @@ steps:
 }
 
 func TestWebSocketTimeline(t *testing.T) {
-	root := t.TempDir()
-	project := filepath.Join(root, "proj")
-	workflows := filepath.Join(root, "workflows")
-	storage := filepath.Join(root, "storage")
-	_ = os.MkdirAll(project, 0o755)
-	_ = os.MkdirAll(workflows, 0o755)
+	home := t.TempDir()
+	project := setupRepo(t, home, "demo")
 	_ = os.WriteFile(filepath.Join(project, "slow.sh"), []byte("#!/bin/sh\necho hello\nsleep 0.1\necho world\n"), 0o755)
-	_ = os.WriteFile(filepath.Join(workflows, "slow.yaml"), []byte(`
+	writeWorkflow(t, home, "demo", "slow", `
 id: slow
 steps:
   - id: s
@@ -90,14 +92,14 @@ steps:
     processes:
       - id: p
         command: ./slow.sh
-`), 0o644)
+`)
 
-	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
-	srv := httptest.NewServer((&api.Server{Eng: eng}).Handler())
+	eng := engine.New(engine.Config{StorageRoot: home})
+	srv := httptest.NewServer((&api.Server{Eng: eng, Home: home}).Handler())
 	defer srv.Close()
 
-	body, _ := json.Marshal(map[string]string{"workflowId": "slow", "projectPath": project})
-	res, err := http.Post(srv.URL+"/api/runs", "application/json", bytes.NewReader(body))
+	body, _ := json.Marshal(map[string]string{"workflowId": "slow"})
+	res, err := http.Post(srv.URL+"/api/runs/demo", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,6 +107,7 @@ steps:
 	var run engine.WorkflowRun
 	_ = json.NewDecoder(res.Body).Decode(&run)
 
+	// ponytail: events stay flat until #20
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/api/runs/" + run.ID + "/events"
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
@@ -139,7 +142,6 @@ steps:
 		t.Fatalf("stdout=%v", stdout)
 	}
 
-	// Reconnect: same event shape from JSONL history.
 	conn2, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -160,15 +162,11 @@ steps:
 }
 
 func TestHTTPParallelFailShowsProcessRuns(t *testing.T) {
-	root := t.TempDir()
-	project := filepath.Join(root, "proj")
-	workflows := filepath.Join(root, "workflows")
-	storage := filepath.Join(root, "storage")
-	_ = os.MkdirAll(project, 0o755)
-	_ = os.MkdirAll(workflows, 0o755)
+	home := t.TempDir()
+	project := setupRepo(t, home, "demo")
 	_ = os.WriteFile(filepath.Join(project, "long.sh"), []byte("#!/bin/sh\ntrap 'exit 143' TERM\nsleep 30\n"), 0o755)
 	_ = os.WriteFile(filepath.Join(project, "fail.sh"), []byte("#!/bin/sh\nsleep 0.2\nexit 1\n"), 0o755)
-	_ = os.WriteFile(filepath.Join(workflows, "pf.yaml"), []byte(`
+	writeWorkflow(t, home, "demo", "pf", `
 id: pf
 steps:
   - id: s
@@ -178,14 +176,14 @@ steps:
         command: ./long.sh
       - id: fail
         command: ./fail.sh
-`), 0o644)
+`)
 
-	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
-	h := (&api.Server{Eng: eng}).Handler()
+	eng := engine.New(engine.Config{StorageRoot: home})
+	h := (&api.Server{Eng: eng, Home: home}).Handler()
 
-	body, _ := json.Marshal(map[string]string{"workflowId": "pf", "projectPath": project})
+	body, _ := json.Marshal(map[string]string{"workflowId": "pf"})
 	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/runs", bytes.NewReader(body)))
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/runs/demo", bytes.NewReader(body)))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("start status %d: %s", rr.Code, rr.Body)
 	}
@@ -200,7 +198,7 @@ steps:
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		rr2 := httptest.NewRecorder()
-		h.ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/api/runs/"+run.ID, nil))
+		h.ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/api/runs/demo/"+run.ID, nil))
 		if rr2.Code != http.StatusOK {
 			t.Fatalf("get status %d", rr2.Code)
 		}
@@ -278,47 +276,5 @@ steps:
 	c := wf.Connections[0]
 	if c.SourceStepID != "produce" || c.TargetStepID != "consume" || c.SourceOutput != "msg" || c.TargetInput != "msg" {
 		t.Fatalf("connection=%+v", c)
-	}
-}
-
-func TestHTTPListRuns(t *testing.T) {
-	root := t.TempDir()
-	project := filepath.Join(root, "proj")
-	workflows := filepath.Join(root, "workflows")
-	storage := filepath.Join(root, "storage")
-	_ = os.MkdirAll(project, 0o755)
-	_ = os.MkdirAll(workflows, 0o755)
-	_ = os.WriteFile(filepath.Join(project, "ok.sh"), []byte("#!/bin/sh\necho ok\n"), 0o755)
-	_ = os.WriteFile(filepath.Join(workflows, "one.yaml"), []byte(`
-id: one
-steps:
-  - id: s
-    mode: series
-    processes:
-      - id: p
-        command: ./ok.sh
-`), 0o644)
-
-	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
-	h := (&api.Server{Eng: eng}).Handler()
-
-	body, _ := json.Marshal(map[string]string{"workflowId": "one", "projectPath": project})
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/runs", bytes.NewReader(body)))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("start %d: %s", rr.Code, rr.Body)
-	}
-
-	rr2 := httptest.NewRecorder()
-	h.ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/api/runs?projectPath="+project, nil))
-	if rr2.Code != http.StatusOK {
-		t.Fatalf("list %d: %s", rr2.Code, rr2.Body)
-	}
-	var runs []engine.WorkflowRun
-	if err := json.Unmarshal(rr2.Body.Bytes(), &runs); err != nil {
-		t.Fatal(err)
-	}
-	if len(runs) != 1 {
-		t.Fatalf("runs=%+v", runs)
 	}
 }

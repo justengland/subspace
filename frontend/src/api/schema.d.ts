@@ -68,7 +68,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs": {
+    "/api/runs/{repo}": {
         parameters: {
             query?: never;
             header?: never;
@@ -84,7 +84,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs/{id}": {
+    "/api/runs/{repo}/{runId}": {
         parameters: {
             query?: never;
             header?: never;
@@ -195,7 +195,7 @@ export interface components {
         };
         StartRequest: {
             workflowId: string;
-            /** @description Override Project; empty uses Workflow.defaultProject */
+            /** @description Optional override; nested start uses Repo registry path when omitted */
             projectPath?: string;
             /** @description stepId.inputName → value */
             inputOverrides?: {
@@ -401,17 +401,17 @@ export interface operations {
     };
     listRuns: {
         parameters: {
-            query?: {
-                /** @description Absolute or relative Project path; empty lists all runs under StorageRoot */
-                projectPath?: string;
-            };
+            query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+            };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description WorkflowRuns from memory + StorageRoot (newest id first) */
+            /** @description WorkflowRuns for the Repo (newest id first) */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -420,14 +420,18 @@ export interface operations {
                     "application/json": components["schemas"]["WorkflowRun"][];
                 };
             };
-            400: components["responses"]["TextError"];
+            404: components["responses"]["TextError"];
+            500: components["responses"]["TextError"];
         };
     };
     startRun: {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+            };
             cookie?: never;
         };
         requestBody: {
@@ -436,7 +440,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Started WorkflowRun */
+            /** @description Started WorkflowRun (execution root from Repo registry) */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -446,6 +450,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["TextError"];
+            404: components["responses"]["TextError"];
         };
     };
     getRun: {
@@ -453,7 +458,9 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["Id"];
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                runId: string;
             };
             cookie?: never;
         };

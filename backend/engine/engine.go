@@ -38,6 +38,7 @@ type Engine struct {
 
 type runRec struct {
 	run  *WorkflowRun
+	repo string // empty for legacy Start (WorkflowsDir); set for StartInRepo
 	jl   *jsonl
 	path string
 	done chan struct{}
@@ -226,6 +227,24 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 	if err != nil {
 		return nil, err
 	}
+	return e.beginRun("", wf, project, req)
+}
+
+// StartInRepo starts a Workflow from StorageRoot/<repo>/workflows and stores
+// artifacts under StorageRoot/<repo>/<run-id>/. project is the Repo absolute path.
+func (e *Engine) StartInRepo(repo, project string, req StartRequest) (*WorkflowRun, error) {
+	wf, err := e.loadWorkflowInRepo(repo, req.WorkflowID)
+	if err != nil {
+		return nil, err
+	}
+	project, err = filepath.Abs(project)
+	if err != nil {
+		return nil, err
+	}
+	return e.beginRun(repo, wf, project, req)
+}
+
+func (e *Engine) beginRun(repo string, wf *workflowDef, project string, req StartRequest) (*WorkflowRun, error) {
 	id := shortID()
 	run := &WorkflowRun{
 		ID:          id,
@@ -233,7 +252,12 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 		ProjectPath: project,
 		Status:      StatusRunning,
 	}
-	runDir := filepath.Join(e.cfg.StorageRoot, filepath.Base(project), id)
+	var runDir string
+	if repo != "" {
+		runDir = filepath.Join(e.cfg.StorageRoot, repo, id)
+	} else {
+		runDir = filepath.Join(e.cfg.StorageRoot, filepath.Base(project), id)
+	}
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -247,7 +271,7 @@ func (e *Engine) Start(req StartRequest) (*WorkflowRun, error) {
 		stepIDs[i] = s.ID
 	}
 	rec := &runRec{
-		run: run, jl: jl, path: jsonlPath, done: make(chan struct{}),
+		run: run, repo: repo, jl: jl, path: jsonlPath, done: make(chan struct{}),
 		resumeCh: make(chan struct{}), stepIDs: stepIDs, rewindTo: -1,
 	}
 	e.mu.Lock()
@@ -404,6 +428,34 @@ func (e *Engine) Get(id string) (*WorkflowRun, error) {
 	return run, err
 }
 
+// GetInRepo returns a WorkflowRun under StorageRoot/<repo>/<id>/.
+func (e *Engine) GetInRepo(repo, id string) (*WorkflowRun, error) {
+	e.mu.Lock()
+	rec, ok := e.runs[id]
+	e.mu.Unlock()
+	if ok {
+		if rec.repo != repo {
+			return nil, fmt.Errorf("WorkflowRun %q not found in repo %q", id, repo)
+		}
+		rec.mu.Lock()
+		cp := *rec.run
+		cp.ProcessRuns = append([]ProcessRun(nil), rec.run.ProcessRuns...)
+		cp.StepRuns = append([]StepRun(nil), rec.run.StepRuns...)
+		rec.mu.Unlock()
+		return &cp, nil
+	}
+	path := filepath.Join(e.cfg.StorageRoot, repo, id, "events.jsonl")
+	events, err := readJSONLFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("WorkflowRun %q not found in repo %q", id, repo)
+	}
+	run := reconstructRun(events)
+	if run.ID == "" {
+		run.ID = id
+	}
+	return run, nil
+}
+
 // List returns WorkflowRuns from memory and StorageRoot, newest id first.
 // Optional projectPath filters by absolute Project path.
 func (e *Engine) List(projectPath string) ([]WorkflowRun, error) {
@@ -437,6 +489,58 @@ func (e *Engine) List(projectPath string) ([]WorkflowRun, error) {
 		return nil, err
 	}
 	out = append(out, disk...)
+	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
+	return out, nil
+}
+
+// ListInRepo returns WorkflowRuns for one Repo (memory + StorageRoot/<repo>/), newest first.
+func (e *Engine) ListInRepo(repo string) ([]WorkflowRun, error) {
+	seen := map[string]struct{}{}
+	var out []WorkflowRun
+
+	e.mu.Lock()
+	for _, rec := range e.runs {
+		if rec.repo != repo {
+			continue
+		}
+		rec.mu.Lock()
+		cp := *rec.run
+		cp.ProcessRuns = append([]ProcessRun(nil), rec.run.ProcessRuns...)
+		cp.StepRuns = append([]StepRun(nil), rec.run.StepRuns...)
+		out = append(out, cp)
+		seen[cp.ID] = struct{}{}
+		rec.mu.Unlock()
+	}
+	e.mu.Unlock()
+
+	dir := filepath.Join(e.cfg.StorageRoot, repo)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
+			return out, nil
+		}
+		return nil, err
+	}
+	for _, ent := range entries {
+		if !ent.IsDir() || ent.Name() == "workflows" {
+			continue
+		}
+		id := ent.Name()
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		path := filepath.Join(dir, id, "events.jsonl")
+		events, err := readJSONLFile(path)
+		if err != nil || len(events) == 0 {
+			continue
+		}
+		run := reconstructRun(events)
+		if run.ID == "" {
+			run.ID = id
+		}
+		out = append(out, *run)
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
 	return out, nil
 }

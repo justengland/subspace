@@ -4,7 +4,8 @@ info:
   version: 0.1.0
   description: |
     HTTP control plane for WorkflowRuns. Live timeline events use WebSocket at
-    GET /api/runs/{id}/events (see TimelineEvent); not a generated HTTP call.
+    GET /api/runs/{id}/events (flat until nested debugger #20; see TimelineEvent);
+    not a generated HTTP call.
 servers:
   - url: http://localhost:4201
 paths:
@@ -73,29 +74,28 @@ paths:
                 $ref: "#/components/schemas/Workflow"
         "404":
           $ref: "#/components/responses/TextError"
-  /api/runs:
+  /api/runs/{repo}:
     get:
       operationId: listRuns
       parameters:
-        - name: projectPath
-          in: query
-          required: false
-          schema:
-            type: string
-          description: Absolute or relative Project path; empty lists all runs under StorageRoot
+        - $ref: "#/components/parameters/RepoName"
       responses:
         "200":
-          description: WorkflowRuns from memory + StorageRoot (newest id first)
+          description: WorkflowRuns for the Repo (newest id first)
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: "#/components/schemas/WorkflowRun"
-        "400":
+        "404":
+          $ref: "#/components/responses/TextError"
+        "500":
           $ref: "#/components/responses/TextError"
     post:
       operationId: startRun
+      parameters:
+        - $ref: "#/components/parameters/RepoName"
       requestBody:
         required: true
         content:
@@ -104,18 +104,25 @@ paths:
               $ref: "#/components/schemas/StartRequest"
       responses:
         "200":
-          description: Started WorkflowRun
+          description: Started WorkflowRun (execution root from Repo registry)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/WorkflowRun"
         "400":
           $ref: "#/components/responses/TextError"
-  /api/runs/{id}:
+        "404":
+          $ref: "#/components/responses/TextError"
+  /api/runs/{repo}/{runId}:
     get:
       operationId: getRun
       parameters:
-        - $ref: "#/components/parameters/Id"
+        - $ref: "#/components/parameters/RepoName"
+        - name: runId
+          in: path
+          required: true
+          schema:
+            type: string
       responses:
         "200":
           description: WorkflowRun
@@ -241,7 +248,7 @@ components:
           type: string
         projectPath:
           type: string
-          description: Override Project; empty uses Workflow.defaultProject
+          description: Optional override; nested start uses Repo registry path when omitted
         inputOverrides:
           type: object
           additionalProperties:

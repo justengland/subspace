@@ -2,6 +2,7 @@ package registry
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -42,18 +43,36 @@ func List(home string) ([]Repo, error) {
 	return out, nil
 }
 
-// Has reports whether name is registered in home/repos.json.
-func Has(home, name string) (bool, error) {
+// NotFoundError means the Repo name is not in the registry.
+type NotFoundError struct{ Name string }
+
+func (e *NotFoundError) Error() string { return "unknown repo: " + e.Name }
+
+// AbsolutePath returns the registered working-tree path for name.
+func AbsolutePath(home, name string) (string, error) {
 	repos, err := List(home)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	for _, r := range repos {
 		if r.Name == name {
-			return true, nil
+			return r.AbsolutePath, nil
 		}
 	}
-	return false, nil
+	return "", &NotFoundError{Name: name}
+}
+
+// Has reports whether name is registered in home/repos.json.
+func Has(home, name string) (bool, error) {
+	_, err := AbsolutePath(home, name)
+	if err == nil {
+		return true, nil
+	}
+	var nf *NotFoundError
+	if errors.As(err, &nf) {
+		return false, nil
+	}
+	return false, err
 }
 
 // Add registers name → absolutePath in home/repos.json, creating the file if needed.
