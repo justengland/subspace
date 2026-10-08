@@ -3,6 +3,8 @@ import type { components, paths } from "./schema";
 
 export type WorkflowRun = components["schemas"]["WorkflowRun"];
 export type Workflow = components["schemas"]["Workflow"];
+export type StepView = components["schemas"]["StepView"];
+export type Connection = components["schemas"]["Connection"];
 export type TimelineEvent = components["schemas"]["TimelineEvent"];
 export type StartRequest = components["schemas"]["StartRequest"];
 

@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { API_BASE, api, type StartRequest, type TimelineEvent, type Workflow, type WorkflowRun } from "./api/client";
+import { Canvas, type StepStatus } from "./canvas/Canvas";
 
 /** Parse "step.input=value" lines into InputOverrides. */
 function parseInputOverrides(text: string): Record<string, string> {
@@ -34,6 +35,32 @@ function wsURL(path: string) {
   return `${base}${path}`;
 }
 
+/** Derive Step status from timeline + WorkflowRun.stepRuns (UI never writes YAML). */
+function deriveStepStatus(run: WorkflowRun | null, events: TimelineEvent[]): Record<string, StepStatus> {
+  const out: Record<string, StepStatus> = {};
+  for (const sr of run?.stepRuns ?? []) {
+    const s = sr.status.toLowerCase();
+    if (s === "running" || s === "started") out[sr.stepId] = "running";
+    else if (s === "succeeded" || s === "success") out[sr.stepId] = "succeeded";
+    else if (s === "failed" || s === "error") out[sr.stepId] = "failed";
+    else if (s === "stopped") out[sr.stepId] = "stopped";
+    else out[sr.stepId] = "idle";
+  }
+  for (const ev of events) {
+    const sid = ev.stepId;
+    if (!sid) continue;
+    if (ev.type === "step_started") out[sid] = "running";
+    else if (ev.type === "step_succeeded") out[sid] = "succeeded";
+    else if (ev.type === "step_failed") out[sid] = "failed";
+  }
+  if (run?.status === "failed" || run?.status === "stopped") {
+    for (const [id, st] of Object.entries(out)) {
+      if (st === "running") out[id] = run.status === "stopped" ? "stopped" : "failed";
+    }
+  }
+  return out;
+}
+
 export default function App() {
   const [workflowId, setWorkflowId] = useState("pipe");
   const [projectPath, setProjectPath] = useState("");
@@ -47,6 +74,8 @@ export default function App() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
+  const stepStatus = useMemo(() => deriveStepStatus(run, events), [run, events]);
+
   useEffect(() => {
     if (!run?.id) return;
     const ws = new WebSocket(wsURL(`/api/runs/${run.id}/events`));
@@ -58,17 +87,23 @@ export default function App() {
           ev.type === "workflow_succeeded" ? "succeeded" : ev.type === "workflow_stopped" ? "stopped" : "failed";
         setRun((r) => (r ? { ...r, status } : r));
       }
+      if (ev.type === "workflow_paused") {
+        setRun((r) => (r ? { ...r, status: "paused" } : r));
+      }
+      if (ev.type === "step_started" && ev.stepId) {
+        setRun((r) => (r ? { ...r, cursorStepId: ev.stepId } : r));
+      }
     };
     ws.onerror = () => setError("WebSocket error");
     return () => ws.close();
   }, [run?.id, timelineKey]);
 
-  async function loadWiring() {
+  async function loadWorkflow(id = workflowId) {
     setBusy(true);
     setError("");
     try {
       const { data, error: err } = await api.GET("/api/workflows/{id}", {
-        params: { path: { id: workflowId } },
+        params: { path: { id } },
       });
       if (err || !data) throw new Error(typeof err === "string" ? err : "getWorkflow failed");
       setWorkflow(data);
@@ -85,6 +120,14 @@ export default function App() {
     setError("");
     setEvents([]);
     try {
+      if (!workflow || workflow.id !== workflowId) {
+        const { data: wf, error: werr } = await api.GET("/api/workflows/{id}", {
+          params: { path: { id: workflowId } },
+        });
+        if (werr || !wf) throw new Error(typeof werr === "string" ? werr : "getWorkflow failed");
+        setWorkflow(wf);
+        if (!projectPath && wf.defaultProject) setProjectPath(wf.defaultProject);
+      }
       const body: StartRequest = { workflowId };
       if (projectPath) body.projectPath = projectPath;
       const inputs = parseInputOverrides(inputOverrideText);
@@ -166,8 +209,26 @@ export default function App() {
   }
 
   return (
-    <main style={{ fontFamily: "system-ui", maxWidth: 640, margin: "2rem auto" }}>
+    <main style={{ fontFamily: "system-ui", maxWidth: 960, margin: "1.5rem auto", padding: "0 1rem" }}>
       <h1>Subspace</h1>
+      <p style={{ color: "#555", marginTop: -8 }}>Canvas debugger (phase 1 — definition YAML is read-only)</p>
+
+      {workflow && (
+        <section style={{ marginTop: 12 }}>
+          <h2 style={{ fontSize: "1rem", marginBottom: 8 }}>
+            Canvas · {workflow.id}
+            {run ? ` · run ${run.id} (${run.status})` : ""}
+          </h2>
+          <Canvas
+            steps={workflow.steps}
+            connections={workflow.connections}
+            stepStatus={stepStatus}
+            cursorStepId={run?.cursorStepId}
+            onSelectStep={setRewindStepId}
+          />
+        </section>
+      )}
+
       <label>
         Workflow ID
         <input value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} style={{ display: "block", width: "100%" }} />
@@ -185,11 +246,11 @@ export default function App() {
         <textarea value={argOverrideText} onChange={(e) => setArgOverrideText(e.target.value)} rows={3} style={{ display: "block", width: "100%" }} />
       </label>
       <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
-        <button disabled={busy} onClick={loadWiring}>
-          Show wiring
+        <button disabled={busy} onClick={() => loadWorkflow()}>
+          Load canvas
         </button>
         <button disabled={busy} onClick={start}>
-          Start run
+          Start
         </button>
         <button disabled={busy || !run} onClick={refresh}>
           Refresh status
@@ -208,7 +269,7 @@ export default function App() {
         </button>
       </div>
       <label style={{ display: "block", marginTop: 8 }}>
-        Rewind to Step ID
+        Rewind to Step ID (click a canvas Step to fill)
         <span style={{ display: "flex", gap: 8, marginTop: 4 }}>
           <input value={rewindStepId} onChange={(e) => setRewindStepId(e.target.value)} style={{ flex: 1 }} />
           <button disabled={busy || !run || !rewindStepId.trim()} onClick={rewind}>
@@ -217,35 +278,14 @@ export default function App() {
         </span>
       </label>
       {error && <p style={{ color: "crimson" }}>{error}</p>}
-      {workflow && (
-        <section style={{ marginTop: 16 }}>
-          <h2 style={{ fontSize: "1rem" }}>Wiring ({workflow.id})</h2>
-          {workflow.defaultProject && <p>defaultProject: {workflow.defaultProject}</p>}
-          {workflow.connections.length === 0 ? (
-            <p>No connections</p>
-          ) : (
-            <ul>
-              {workflow.connections.map((c, i) => (
-                <li key={i}>
-                  {c.sourceStepId}.{c.sourceOutput} → {c.targetStepId}.{c.targetInput}
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-      )}
-      {run && (
-        <pre style={{ background: "#f4f4f4", padding: 12, marginTop: 16 }}>
-          {JSON.stringify(run, null, 2)}
-        </pre>
-      )}
       {events.length > 0 && (
         <section style={{ marginTop: 16 }}>
           <h2 style={{ fontSize: "1rem" }}>Timeline</h2>
-          <ol style={{ listStyle: "none", padding: 0, margin: 0, fontFamily: "ui-monospace, monospace", fontSize: 13 }}>
+          <ol style={{ listStyle: "none", padding: 0, margin: 0, fontFamily: "ui-monospace, monospace", fontSize: 13, maxHeight: 240, overflow: "auto" }}>
             {events.map((ev, i) => (
               <li key={i} style={{ borderBottom: "1px solid #ddd", padding: "4px 0" }}>
                 <span style={{ color: "#666" }}>{ev.type}</span>
+                {ev.stepId != null && <span> {ev.stepId}</span>}
                 {ev.data != null && <span> {ev.data}</span>}
                 {ev.processId != null && ev.data == null && <span> {ev.processId}</span>}
               </li>
