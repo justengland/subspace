@@ -149,6 +149,181 @@ steps:
 	}
 }
 
+func TestDecisionExactlyOneMatchRunsProcess(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(project, "csv.sh"), "#!/bin/sh\ntouch \"$PWD/csv.done\"\n")
+	writeFile(t, filepath.Join(project, "json.sh"), "#!/bin/sh\ntouch \"$PWD/json.done\"\n")
+	chmodX(t, filepath.Join(project, "csv.sh"))
+	chmodX(t, filepath.Join(project, "json.sh"))
+
+	writeFile(t, filepath.Join(workflows, "decision.yaml"), `
+id: decision
+steps:
+  - id: set-kind
+    mode: series
+    outputs:
+      - name: kind
+        value: csv
+    processes:
+      - id: noop
+        command: true
+  - id: branch
+    mode: decision
+    inputs:
+      - name: kind
+        source:
+          stepId: set-kind
+          output: kind
+    processes:
+      - id: handle-csv
+        when:
+          eq:
+            input: kind
+            value: csv
+        command: ./csv.sh
+      - id: handle-json
+        when:
+          in:
+            input: kind
+            values: [json, ndjson]
+        command: ./json.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{WorkflowID: "decision", ProjectPath: project})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if run.Status != engine.StatusSucceeded {
+		t.Fatalf("status=%s want succeeded", run.Status)
+	}
+	if _, err := os.Stat(filepath.Join(project, "csv.done")); err != nil {
+		t.Fatalf("csv process did not run: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(project, "json.done")); err == nil {
+		t.Fatal("json process ran but should not")
+	}
+}
+
+func TestDecisionZeroMatchesFails(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(project, "csv.sh"), "#!/bin/sh\ntouch \"$PWD/csv.done\"\n")
+	chmodX(t, filepath.Join(project, "csv.sh"))
+
+	writeFile(t, filepath.Join(workflows, "decision.yaml"), `
+id: decision
+steps:
+  - id: set-kind
+    mode: series
+    outputs:
+      - name: kind
+        value: xml
+    processes:
+      - id: noop
+        command: true
+  - id: branch
+    mode: decision
+    inputs:
+      - name: kind
+        source:
+          stepId: set-kind
+          output: kind
+    processes:
+      - id: handle-csv
+        when:
+          eq:
+            input: kind
+            value: csv
+        command: ./csv.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{WorkflowID: "decision", ProjectPath: project})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if run.Status != engine.StatusFailed {
+		t.Fatalf("status=%s want failed", run.Status)
+	}
+	if _, err := os.Stat(filepath.Join(project, "csv.done")); err == nil {
+		t.Fatal("csv process ran on zero-match")
+	}
+}
+
+func TestDecisionMultipleMatchesFails(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	workflows := filepath.Join(root, "workflows")
+	storage := filepath.Join(root, "storage")
+	mustMkdir(t, project)
+	mustMkdir(t, workflows)
+
+	writeFile(t, filepath.Join(project, "a.sh"), "#!/bin/sh\ntouch \"$PWD/a.done\"\n")
+	writeFile(t, filepath.Join(project, "b.sh"), "#!/bin/sh\ntouch \"$PWD/b.done\"\n")
+	chmodX(t, filepath.Join(project, "a.sh"))
+	chmodX(t, filepath.Join(project, "b.sh"))
+
+	// eq and exists both match when kind is present → multi-match fail.
+	writeFile(t, filepath.Join(workflows, "decision.yaml"), `
+id: decision
+steps:
+  - id: set-kind
+    mode: series
+    outputs:
+      - name: kind
+        value: csv
+    processes:
+      - id: noop
+        command: true
+  - id: branch
+    mode: decision
+    inputs:
+      - name: kind
+        source:
+          stepId: set-kind
+          output: kind
+    processes:
+      - id: by-eq
+        when:
+          eq:
+            input: kind
+            value: csv
+        command: ./a.sh
+      - id: by-exists
+        when:
+          exists:
+            input: kind
+        command: ./b.sh
+`)
+
+	eng := engine.New(engine.Config{WorkflowsDir: workflows, StorageRoot: storage})
+	run, err := eng.Start(engine.StartRequest{WorkflowID: "decision", ProjectPath: project})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if run.Status != engine.StatusFailed {
+		t.Fatalf("status=%s want failed", run.Status)
+	}
+	if _, err := os.Stat(filepath.Join(project, "a.done")); err == nil {
+		t.Fatal("process ran on multi-match")
+	}
+	if _, err := os.Stat(filepath.Join(project, "b.done")); err == nil {
+		t.Fatal("process ran on multi-match")
+	}
+}
+
 func TestConnectionsDerivedFromInputSource(t *testing.T) {
 	root := t.TempDir()
 	workflows := filepath.Join(root, "workflows")
