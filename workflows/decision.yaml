@@ -81,7 +81,7 @@ steps:
       visualization:
         position:
             x: 90.88746643066406
-            "y": 138
+            "y": 137.52798461914062
         size:
             width: 300
             height: 46
