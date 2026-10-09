@@ -18,13 +18,6 @@ steps:
           arguments: []
           workingDirectory: ""
           when: null
-      visualization:
-        position:
-            x: 90.40023803710938
-            "y": 32.798126220703125
-        size:
-            width: 300
-            height: 46
     - id: decide
       name: Decision
       mode: decision
@@ -78,10 +71,3 @@ steps:
             in: null
             exists:
                 input: tag
-      visualization:
-        position:
-            x: 176.1738739013672
-            "y": 223.95300674438477
-        size:
-            width: 168
-            height: 46
