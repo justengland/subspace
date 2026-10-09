@@ -28,6 +28,14 @@ _Avoid_: Parameter, argument (reserve argument for Process CLI args)
 A named value a Step produces for downstream Steps.
 _Avoid_: Result, artifact (artifact means a file on disk produced by a run)
 
+**Attachment**:
+A named file owned by a Step and made available to its Processes. An image is just an Attachment. An Attachment marked for expansion gets Bang expansion before a Process reads it; that is how prompts are written. Processes own no prompt text; they read Attachments through ordinary shell.
+_Avoid_: Artifact (a file produced by a run), upload, asset, Prompt (not a separate concept)
+
+**Bang expansion**:
+Inside an expanding Attachment, `` !`command` `` is replaced by that shell command's stdout. The expanded text is recorded on the StepRun. Single pass: inserted output is never expanded again, and a Bang command may not read any expanding Attachment (from any Step), so one prompt can never pull in another.
+_Avoid_: Interpolation, substitution (too generic)
+
 **Visualization**:
 Optional layout metadata (position, size, UI metadata) on Workflow, Step, Process, or Connection. Never affects execution.
 
