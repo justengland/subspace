@@ -78,3 +78,10 @@ steps:
             in: null
             exists:
                 input: tag
+      visualization:
+        position:
+            x: 24
+            "y": 36
+        size:
+            width: 168
+            height: 46
