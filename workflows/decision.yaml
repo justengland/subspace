@@ -20,8 +20,8 @@ steps:
           when: null
       visualization:
         position:
-            x: 156.41445922851562
-            "y": 37.774959564208984
+            x: 156.9713134765625
+            "y": 39.375911712646484
         size:
             width: 168
             height: 46
