@@ -49,7 +49,7 @@ herdr pane rename "$back_pane" backend >/dev/null
 
 # No `exec`: if the server exits, the shell (and pane) stay so the error is visible.
 herdr pane run "$front_pane" \
-  "cd $(printf '%q' "$ROOT/frontend") && (test -d node_modules || npm install) && env VITE_API_URL=$(printf '%q' "$API_URL") npm run dev -- --host 127.0.0.1 --port $(printf '%q' "$FRONT_PORT")"
+  "cd $(printf '%q' "$ROOT/frontend") && (test -d node_modules || bun install --ignore-scripts) && env VITE_API_URL=$(printf '%q' "$API_URL") SUBSPACE_FRONT_PORT=$(printf '%q' "$FRONT_PORT") bun run dev"
 
 herdr pane run "$back_pane" \
   "cd $(printf '%q' "$ROOT/backend") && go run ./cmd/subspace -addr $(printf '%q' "$ADDR")"

@@ -3,12 +3,14 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "trustedDependencies": [],
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
+    "api-url": "bun -e 'await Bun.write(\"src/api/base.ts\", `export const API_BASE = ${JSON.stringify(process.env.VITE_API_URL ?? \"http://localhost:4201\")};\\n`)'",
+    "dev": "bun run api-url && bun ./serve.ts",
+    "build": "bun run api-url && tsc -b && bun build ./index.html --outdir dist --minify",
     "lint": "oxlint",
-    "preview": "vite preview",
-    "codegen": "npx --yes openapi-typescript@7.13.0 ../openapi/openapi.yaml -o src/api/schema.d.ts"
+    "preview": "bun --port ${SUBSPACE_FRONT_PORT:-4200} ./dist/index.html",
+    "codegen": "openapi-typescript ../openapi/openapi.yaml -o src/api/schema.d.ts"
   },
   "dependencies": {
     "openapi-fetch": "^0.15.0",
@@ -16,12 +18,10 @@
     "react-dom": "^19.2.8"
   },
   "devDependencies": {
-    "@types/node": "^24.13.3",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
-    "@vitejs/plugin-react": "^6.1.1",
+    "openapi-typescript": "7.13.0",
     "oxlint": "^1.81.0",
-    "typescript": "~6.0.2",
-    "vite": "^8.3.0"
+    "typescript": "~6.0.2"
   }
 }
