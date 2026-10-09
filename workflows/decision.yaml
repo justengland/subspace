@@ -1,49 +1,73 @@
 id: decision
 name: Decision
+defaultProject: ""
 steps:
-  - id: set-kind
-    name: Set Kind
-    mode: series
-    outputs:
-      - name: kind
-        value: csv
-    processes:
-      - id: noop
-        name: Noop
-        command: true
-  - id: decide
-    name: Decision
-    mode: decision
-    visualization:
-      position:
-        x: 220
-        y: 40
-    inputs:
-      - name: kind
-        source:
-          stepId: set-kind
-          output: kind
-    processes:
-      - id: handle-csv
-        name: Handle CSV
-        when:
-          eq:
-            input: kind
-            value: csv
-        command: sh
-        arguments: ["-c", "echo csv"]
-      - id: handle-json
-        name: Handle JSON
-        when:
-          in:
-            input: kind
-            values: [json, ndjson]
-        command: sh
-        arguments: ["-c", "echo json"]
-      - id: handle-tagged
-        name: Handle Tagged
-        when:
-          exists:
-            input: tag
-        command: sh
-        arguments: ["-c", "echo tagged"]
+    - id: set-kind
+      name: Set Kind
+      mode: series
+      maxIterations: null
+      when: null
+      inputs: []
+      outputs:
+        - name: kind
+          value: csv
+      processes:
+        - id: noop
+          name: Noop
+          command: "true"
+          arguments: []
+          workingDirectory: ""
+          when: null
+    - id: decide
+      name: Decision
+      mode: decision
+      maxIterations: null
+      when: null
+      inputs:
+        - name: kind
+          value: ""
+          source:
+            stepId: set-kind
+            output: kind
+      outputs: []
+      processes:
+        - id: handle-csv
+          name: Handle CSV
+          command: sh
+          arguments:
+            - -c
+            - echo csv
+          workingDirectory: ""
+          when:
+            eq:
+                input: kind
+                value: csv
+            in: null
+            exists: null
+        - id: handle-json
+          name: Handle JSON
+          command: sh
+          arguments:
+            - -c
+            - echo json
+          workingDirectory: ""
+          when:
+            eq: null
+            in:
+                input: kind
+                values:
+                    - json
+                    - ndjson
+            exists: null
+        - id: handle-tagged
+          name: Handle Tagged
+          command: sh
+          arguments:
+            - -c
+            - echo tagged
+          workingDirectory: ""
+          when:
+            eq: null
+            in: null
+            exists:
+                input: tag
