@@ -80,8 +80,8 @@ steps:
                 input: tag
       visualization:
         position:
-            x: 24
-            "y": 36
+            x: 235.93939208984375
+            "y": 246.34599685668945
         size:
             width: 168
             height: 46
