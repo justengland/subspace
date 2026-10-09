@@ -38,6 +38,9 @@ func TestOpenAPICoversControlPlane(t *testing.T) {
 		"operationId: listRuns",
 		"operationId: listRepos",
 		"operationId: listWorkflows",
+		"operationId: patchWorkflowVisualization",
+		"ProcessView:",
+		"VizSize:",
 	} {
 		if !strings.Contains(doc, path) {
 			t.Fatalf("openapi.yaml missing %q", path)

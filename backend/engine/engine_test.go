@@ -1340,8 +1340,12 @@ steps:
       position:
         x: 100
         y: 200
+      size:
+        width: 240
+        height: 120
     processes:
       - id: p
+        name: Proc
         command: true
   - id: b
     name: B
@@ -1362,7 +1366,133 @@ steps:
 	if wf.Steps[0].Visualization.Position.X != 100 || wf.Steps[0].Visualization.Position.Y != 200 {
 		t.Fatalf("viz=%+v", wf.Steps[0].Visualization)
 	}
+	if wf.Steps[0].Visualization.Size == nil || wf.Steps[0].Visualization.Size.Width != 240 || wf.Steps[0].Visualization.Size.Height != 120 {
+		t.Fatalf("size=%+v", wf.Steps[0].Visualization.Size)
+	}
+	if len(wf.Steps[0].Processes) != 1 || wf.Steps[0].Processes[0].ID != "p" || wf.Steps[0].Processes[0].Name != "Proc" {
+		t.Fatalf("processes=%+v", wf.Steps[0].Processes)
+	}
+	if len(wf.Steps[1].Processes) != 1 || wf.Steps[1].Processes[0].Name != "p2" {
+		t.Fatalf("step b processes=%+v", wf.Steps[1].Processes)
+	}
 	if wf.Steps[1].Visualization != nil {
 		t.Fatalf("step b should have no visualization")
+	}
+}
+
+func TestPatchStepVisualizationsInRepo(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "demo", "workflows")
+	mustMkdir(t, dir)
+	writeFile(t, filepath.Join(dir, "viz.yaml"), `
+id: viz
+name: Viz
+steps:
+  - id: a
+    name: A
+    mode: series
+    processes:
+      - id: p
+        command: true
+`)
+	eng := engine.New(engine.Config{StorageRoot: root})
+	_, err := eng.PatchStepVisualizationsInRepo("demo", "viz", []engine.StepVizPatch{{
+		ID: "a",
+		Visualization: &engine.Visualization{
+			Position: &engine.VizPosition{X: 10, Y: 20},
+			Size:     &engine.VizSize{Width: 200, Height: 100},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wf, err := eng.GetWorkflowInRepo("demo", "viz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := wf.Steps[0].Visualization
+	if v == nil || v.Position == nil || v.Position.X != 10 || v.Position.Y != 20 {
+		t.Fatalf("position=%+v", v)
+	}
+	if v.Size == nil || v.Size.Width != 200 || v.Size.Height != 100 {
+		t.Fatalf("size=%+v", v.Size)
+	}
+	if _, err := eng.PatchStepVisualizationsInRepo("demo", "viz", []engine.StepVizPatch{{
+		ID:            "a",
+		Visualization: &engine.Visualization{},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	wf, err = eng.GetWorkflowInRepo("demo", "viz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wf.Steps[0].Visualization != nil {
+		t.Fatalf("cleared viz=%+v", wf.Steps[0].Visualization)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "viz.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "visualization") {
+		t.Fatalf("yaml still has visualization: %s", raw)
+	}
+}
+
+func TestPatchProcessInRepo(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "demo", "workflows")
+	mustMkdir(t, dir)
+	writeFile(t, filepath.Join(dir, "edit.yaml"), `
+id: edit
+name: Edit
+steps:
+  - id: decide
+    name: Decision
+    mode: decision
+    processes:
+      - id: handle-csv
+        name: Handle CSV
+        command: "true"
+        arguments: []
+        workingDirectory: ""
+        when: null
+`)
+	eng := engine.New(engine.Config{StorageRoot: root})
+	var patch engine.ProcessPatch
+	if err := json.Unmarshal([]byte(`{
+		"stepId":"decide",
+		"id":"handle-csv",
+		"name":"Handle CSV",
+		"command":"sh",
+		"arguments":["-c","echo csv"],
+		"workingDirectory":"",
+		"when":{"eq":{"input":"kind","value":"csv"}}
+	}`), &patch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.PatchProcessesInRepo("demo", "edit", []engine.ProcessPatch{patch}); err != nil {
+		t.Fatal(err)
+	}
+	wf, err := eng.GetWorkflowInRepo("demo", "edit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(wf.Steps[0].Processes[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(raw)
+	for _, want := range []string{`"command":"sh"`, `"kind"`, `"csv"`, `"-c"`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("process json missing %q: %s", want, got)
+		}
+	}
+	yamlRaw, err := os.ReadFile(filepath.Join(dir, "edit.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(yamlRaw), "echo csv") {
+		t.Fatalf("yaml=%s", yamlRaw)
 	}
 }

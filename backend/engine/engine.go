@@ -114,17 +114,34 @@ type StepView struct {
 	Mode          string         `json:"mode"`
 	Inputs        []InputView    `json:"inputs,omitempty"`
 	Outputs       []OutputView   `json:"outputs,omitempty"`
+	Processes     []ProcessView  `json:"processes,omitempty"`
 	Visualization *Visualization `json:"visualization,omitempty"`
+}
+
+// ProcessView is a Process definition as shown on the canvas (not a ProcessRun).
+type ProcessView struct {
+	ID               string        `json:"id"`
+	Name             string        `json:"name"`
+	Command          string        `json:"command"`
+	Arguments        []string      `json:"arguments,omitempty"`
+	WorkingDirectory string        `json:"workingDirectory,omitempty"`
+	When             *predicateDef `json:"when,omitempty"`
 }
 
 // Visualization is optional layout metadata (never affects execution).
 type Visualization struct {
 	Position *VizPosition `json:"position,omitempty"`
+	Size     *VizSize     `json:"size,omitempty"`
 }
 
 type VizPosition struct {
 	X float64 `json:"x"`
 	Y float64 `json:"y"`
+}
+
+type VizSize struct {
+	Width  float64 `json:"width"`
+	Height float64 `json:"height"`
 }
 
 type InputView struct {
@@ -158,16 +175,22 @@ type stepDef struct {
 	Inputs        []inputDef    `yaml:"inputs"`
 	Outputs       []outputDef   `yaml:"outputs"`
 	Processes     []processDef  `yaml:"processes"`
-	Visualization *vizDef       `yaml:"visualization"`
+	Visualization *vizDef       `yaml:"visualization,omitempty"`
 }
 
 type vizDef struct {
-	Position *vizPosDef `yaml:"position"`
+	Position *vizPosDef  `yaml:"position"`
+	Size     *vizSizeDef `yaml:"size"`
 }
 
 type vizPosDef struct {
 	X float64 `yaml:"x"`
 	Y float64 `yaml:"y"`
+}
+
+type vizSizeDef struct {
+	Width  float64 `yaml:"width"`
+	Height float64 `yaml:"height"`
 }
 
 type inputDef struct {
@@ -197,23 +220,23 @@ type processDef struct {
 
 // Structured YAML predicates (eq / in / exists). Exactly one form per when.
 type predicateDef struct {
-	Eq     *eqPred     `yaml:"eq"`
-	In     *inPred     `yaml:"in"`
-	Exists *existsPred `yaml:"exists"`
+	Eq     *eqPred     `yaml:"eq" json:"eq,omitempty"`
+	In     *inPred     `yaml:"in" json:"in,omitempty"`
+	Exists *existsPred `yaml:"exists" json:"exists,omitempty"`
 }
 
 type eqPred struct {
-	Input string `yaml:"input"`
-	Value string `yaml:"value"`
+	Input string `yaml:"input" json:"input"`
+	Value string `yaml:"value" json:"value"`
 }
 
 type inPred struct {
-	Input  string   `yaml:"input"`
-	Values []string `yaml:"values"`
+	Input  string   `yaml:"input" json:"input"`
+	Values []string `yaml:"values" json:"values"`
 }
 
 type existsPred struct {
-	Input string `yaml:"input"`
+	Input string `yaml:"input" json:"input"`
 }
 
 func New(cfg Config) *Engine {
@@ -907,10 +930,8 @@ func toWorkflowView(wf *workflowDef) *Workflow {
 	out := &Workflow{ID: wf.ID, Name: wf.Name, DefaultProject: wf.DefaultProject}
 	for _, s := range wf.Steps {
 		sv := StepView{ID: s.ID, Name: s.Name, Mode: s.Mode}
-		if s.Visualization != nil && s.Visualization.Position != nil {
-			sv.Visualization = &Visualization{
-				Position: &VizPosition{X: s.Visualization.Position.X, Y: s.Visualization.Position.Y},
-			}
+		if v := toVisualization(s.Visualization); v != nil {
+			sv.Visualization = v
 		}
 		for _, in := range s.Inputs {
 			iv := InputView{Name: in.Name}
@@ -921,6 +942,20 @@ func toWorkflowView(wf *workflowDef) *Workflow {
 		}
 		for _, o := range s.Outputs {
 			sv.Outputs = append(sv.Outputs, OutputView{Name: o.Name, Value: o.Value})
+		}
+		for _, p := range s.Processes {
+			name := p.Name
+			if name == "" {
+				name = p.ID
+			}
+			sv.Processes = append(sv.Processes, ProcessView{
+				ID:               p.ID,
+				Name:             name,
+				Command:          p.Command,
+				Arguments:        p.Arguments,
+				WorkingDirectory: p.WorkingDirectory,
+				When:             p.When,
+			})
 		}
 		out.Steps = append(out.Steps, sv)
 		for _, in := range s.Inputs {
@@ -939,6 +974,148 @@ func toWorkflowView(wf *workflowDef) *Workflow {
 		out.Connections = []Connection{}
 	}
 	return out
+}
+
+func toVisualization(v *vizDef) *Visualization {
+	if v == nil {
+		return nil
+	}
+	out := &Visualization{}
+	if v.Position != nil {
+		out.Position = &VizPosition{X: v.Position.X, Y: v.Position.Y}
+	}
+	if v.Size != nil {
+		out.Size = &VizSize{Width: v.Size.Width, Height: v.Size.Height}
+	}
+	if out.Position == nil && out.Size == nil {
+		return nil
+	}
+	return out
+}
+
+func toVizDef(v *Visualization) *vizDef {
+	if v == nil {
+		return nil
+	}
+	out := &vizDef{}
+	if v.Position != nil {
+		out.Position = &vizPosDef{X: v.Position.X, Y: v.Position.Y}
+	}
+	if v.Size != nil {
+		out.Size = &vizSizeDef{Width: v.Size.Width, Height: v.Size.Height}
+	}
+	if out.Position == nil && out.Size == nil {
+		return nil
+	}
+	return out
+}
+
+// StepVizPatch updates one Step's Visualization (position and/or size).
+type StepVizPatch struct {
+	ID            string         `json:"id"`
+	Visualization *Visualization `json:"visualization"`
+}
+
+// ProcessPatch replaces the editable fields of one Process.
+type ProcessPatch struct {
+	StepID           string        `json:"stepId"`
+	ID               string        `json:"id"`
+	Name             string        `json:"name"`
+	Command          string        `json:"command"`
+	Arguments        []string      `json:"arguments"`
+	WorkingDirectory string        `json:"workingDirectory"`
+	When             *predicateDef `json:"when"`
+}
+
+// PatchStepVisualizationsInRepo writes Step visualization into the Workflow YAML
+// under StorageRoot/<repo>/workflows/<id>.yaml and returns the absolute file path.
+func (e *Engine) PatchStepVisualizationsInRepo(repo, id string, patches []StepVizPatch) (string, error) {
+	path := filepath.Join(e.cfg.StorageRoot, repo, "workflows", id+".yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("load workflow %q/%q: %w", repo, id, err)
+	}
+	var wf workflowDef
+	if err := yaml.Unmarshal(data, &wf); err != nil {
+		return "", err
+	}
+	if wf.ID == "" {
+		wf.ID = id
+	}
+	byID := map[string]*Visualization{}
+	for _, p := range patches {
+		byID[p.ID] = p.Visualization
+	}
+	found := 0
+	for i := range wf.Steps {
+		viz, ok := byID[wf.Steps[i].ID]
+		if !ok {
+			continue
+		}
+		wf.Steps[i].Visualization = toVizDef(viz)
+		found++
+	}
+	if found != len(patches) {
+		return "", fmt.Errorf("unknown step id in visualization patch")
+	}
+	out, err := yaml.Marshal(&wf)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// PatchProcessesInRepo writes Process fields into the Workflow YAML and returns the file path.
+func (e *Engine) PatchProcessesInRepo(repo, id string, patches []ProcessPatch) (string, error) {
+	path := filepath.Join(e.cfg.StorageRoot, repo, "workflows", id+".yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("load workflow %q/%q: %w", repo, id, err)
+	}
+	var wf workflowDef
+	if err := yaml.Unmarshal(data, &wf); err != nil {
+		return "", err
+	}
+	if wf.ID == "" {
+		wf.ID = id
+	}
+	found := 0
+	for i := range wf.Steps {
+		for _, patch := range patches {
+			if wf.Steps[i].ID != patch.StepID {
+				continue
+			}
+			for j := range wf.Steps[i].Processes {
+				if wf.Steps[i].Processes[j].ID != patch.ID {
+					continue
+				}
+				args := patch.Arguments
+				if args == nil {
+					args = []string{}
+				}
+				wf.Steps[i].Processes[j].Name = patch.Name
+				wf.Steps[i].Processes[j].Command = patch.Command
+				wf.Steps[i].Processes[j].Arguments = args
+				wf.Steps[i].Processes[j].WorkingDirectory = patch.WorkingDirectory
+				wf.Steps[i].Processes[j].When = patch.When
+				found++
+			}
+		}
+	}
+	if found != len(patches) {
+		return "", fmt.Errorf("unknown process in patch")
+	}
+	out, err := yaml.Marshal(&wf)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func resolveInputs(step stepDef, outputs map[string]map[string]string, overrides map[string]string) (map[string]string, []string, error) {

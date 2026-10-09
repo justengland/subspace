@@ -65,7 +65,7 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        patch?: never;
+        patch: operations["patchWorkflowVisualization"];
         trace?: never;
     };
     "/api/runs/{repo}": {
@@ -243,14 +243,59 @@ export interface components {
             mode: string;
             inputs?: components["schemas"]["InputView"][];
             outputs?: components["schemas"]["OutputView"][];
+            processes?: components["schemas"]["ProcessView"][];
             visualization?: components["schemas"]["Visualization"];
+        };
+        ProcessView: {
+            id: string;
+            name: string;
+            command: string;
+            arguments?: string[];
+            workingDirectory?: string;
+            when?: components["schemas"]["Predicate"] | null;
+        };
+        Predicate: {
+            eq?: {
+                input: string;
+                value: string;
+            };
+            in?: {
+                input: string;
+                values: string[];
+            };
+            exists?: {
+                input: string;
+            };
+        };
+        ProcessPatch: {
+            stepId: string;
+            id: string;
+            name: string;
+            command: string;
+            arguments?: string[];
+            workingDirectory?: string;
+            when?: components["schemas"]["Predicate"] | null;
         };
         Visualization: {
             position?: components["schemas"]["VizPosition"];
+            size?: components["schemas"]["VizSize"];
         };
         VizPosition: {
             x: number;
             y: number;
+        };
+        VizSize: {
+            width: number;
+            height: number;
+        };
+        /** @description Send steps, processes, or both. */
+        PatchWorkflowVisualization: {
+            steps?: components["schemas"]["StepVizPatch"][];
+            processes?: components["schemas"]["ProcessPatch"][];
+        };
+        StepVizPatch: {
+            id: string;
+            visualization: components["schemas"]["Visualization"];
         };
         InputView: {
             name: string;
@@ -397,6 +442,36 @@ export interface operations {
                     "application/json": components["schemas"]["Workflow"];
                 };
             };
+            404: components["responses"]["TextError"];
+        };
+    };
+    patchWorkflowVisualization: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Registered Repo name */
+                repo: components["parameters"]["RepoName"];
+                workflowId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PatchWorkflowVisualization"];
+            };
+        };
+        responses: {
+            /** @description Workflow after visualization patch (YAML updated and committed in Repo) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Workflow"];
+                };
+            };
+            400: components["responses"]["TextError"];
             404: components["responses"]["TextError"];
         };
     };

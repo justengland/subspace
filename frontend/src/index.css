@@ -13,6 +13,10 @@
   --color-ink: #f2f2f5;
   --color-muted: #9a9aad;
   --color-accent: #ea4b3a;
+  --color-node-series: #3d8bfd;
+  --color-node-decision: #f0a202;
+  --color-node-parallel: #a78bfa;
+  --color-node-loop: #2bb673;
   --color-edge: #6b6b7b;
   --color-success: #2bb673;
   --color-warn: #f0a202;
@@ -254,6 +258,14 @@ textarea {
   min-height: 100%;
 }
 
+.wf-edge {
+  fill: none;
+  stroke: var(--color-edge);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .canvas-empty {
   display: flex;
   align-items: center;
@@ -300,7 +312,8 @@ textarea {
 }
 
 .field input,
-.field textarea {
+.field textarea,
+.field select {
   width: 100%;
   background: var(--color-panel-2);
   border: 1px solid var(--color-border);
@@ -317,7 +330,8 @@ textarea {
 }
 
 .field input:focus,
-.field textarea:focus {
+.field textarea:focus,
+.field select:focus {
   outline: 1px solid color-mix(in srgb, var(--color-accent) 55%, transparent);
   border-color: var(--color-accent);
 }

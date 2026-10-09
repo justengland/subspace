@@ -3,7 +3,11 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 
 	"github.com/gorilla/websocket"
 	"github.com/justengland/subspace/backend/engine"
@@ -30,6 +34,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/runs/{repo}/{runId}/rewind", s.rewindRun)
 	mux.HandleFunc("GET /api/runs/{repo}/{runId}", s.getRun)
 	mux.HandleFunc("GET /api/workflows/{repo}/{workflowId}", s.getWorkflow)
+	mux.HandleFunc("PATCH /api/workflows/{repo}/{workflowId}", s.patchWorkflowVisualization)
 	mux.HandleFunc("GET /api/workflows/{repo}", s.listWorkflows)
 	mux.HandleFunc("GET /api/repos", s.listRepos)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -248,6 +253,105 @@ func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, wf)
 }
 
+func (s *Server) patchWorkflowVisualization(w http.ResponseWriter, r *http.Request) {
+	repo := r.PathValue("repo")
+	id := r.PathValue("workflowId")
+	if repo == "" || id == "" {
+		http.Error(w, "missing repo or workflowId", http.StatusBadRequest)
+		return
+	}
+	if !s.requireRepo(w, repo) {
+		return
+	}
+	var body struct {
+		Steps     []engine.StepVizPatch `json:"steps"`
+		Processes []engine.ProcessPatch `json:"processes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body.Steps) == 0 && len(body.Processes) == 0 {
+		http.Error(w, "steps or processes required", http.StatusBadRequest)
+		return
+	}
+	var homePath string
+	var err error
+	msg := "Update workflow visualization"
+	if len(body.Processes) > 0 {
+		homePath, err = s.Eng.PatchProcessesInRepo(repo, id, body.Processes)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		msg = "Update workflow process"
+	}
+	if len(body.Steps) > 0 {
+		homePath, err = s.Eng.PatchStepVisualizationsInRepo(repo, id, body.Steps)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	if err := commitWorkflowYAML(s.Home, repo, id, homePath, msg); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	wf, err := s.Eng.GetWorkflowInRepo(repo, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, wf)
+}
+
+// commitWorkflowYAML mirrors the Workflow YAML into the registered Repo working
+// tree under workflows/<id>.yaml and git-commits it. No-op if AbsolutePath is
+// not a git work tree.
+func commitWorkflowYAML(home, repo, id, homePath, message string) error {
+	abs, err := registry.AbsolutePath(home, repo)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(abs, ".git")); err != nil {
+		return nil // ponytail: skip commit when Repo is not a git checkout
+	}
+	data, err := os.ReadFile(homePath)
+	if err != nil {
+		return err
+	}
+	destDir := filepath.Join(abs, "workflows")
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return err
+	}
+	dest := filepath.Join(destDir, id+".yaml")
+	if err := os.WriteFile(dest, data, 0o644); err != nil {
+		return err
+	}
+	rel := filepath.Join("workflows", id+".yaml")
+	add := exec.Command("git", "-C", abs, "add", "--", rel)
+	if out, err := add.CombinedOutput(); err != nil {
+		return fmt.Errorf("git add: %w: %s", err, out)
+	}
+	commit := exec.Command("git", "-C", abs, "commit", "-m", message, "--", rel)
+	if out, err := commit.CombinedOutput(); err != nil {
+		// nothing to commit is fine (identical content)
+		if commit.ProcessState != nil && commit.ProcessState.ExitCode() == 1 {
+			return nil
+		}
+		return fmt.Errorf("git commit: %w: %s", err, out)
+	}
+	return nil
+}
+
 func (s *Server) followRun(w http.ResponseWriter, r *http.Request) {
 	repo, id, ok := s.runPath(w, r)
 	if !ok {
@@ -283,7 +387,7 @@ func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

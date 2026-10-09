@@ -73,6 +73,32 @@ paths:
                 $ref: "#/components/schemas/Workflow"
         "404":
           $ref: "#/components/responses/TextError"
+    patch:
+      operationId: patchWorkflowVisualization
+      parameters:
+        - $ref: "#/components/parameters/RepoName"
+        - name: workflowId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchWorkflowVisualization"
+      responses:
+        "200":
+          description: Workflow after visualization patch (YAML updated and committed in Repo)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workflow"
+        "400":
+          $ref: "#/components/responses/TextError"
+        "404":
+          $ref: "#/components/responses/TextError"
   /api/runs/{repo}:
     get:
       operationId: listRuns
@@ -357,13 +383,88 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/OutputView"
+        processes:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProcessView"
         visualization:
           $ref: "#/components/schemas/Visualization"
+    ProcessView:
+      type: object
+      required: [id, name, command]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        command:
+          type: string
+        arguments:
+          type: array
+          items:
+            type: string
+        workingDirectory:
+          type: string
+        when:
+          oneOf:
+            - $ref: "#/components/schemas/Predicate"
+            - type: "null"
+    Predicate:
+      type: object
+      properties:
+        eq:
+          type: object
+          required: [input, value]
+          properties:
+            input:
+              type: string
+            value:
+              type: string
+        in:
+          type: object
+          required: [input, values]
+          properties:
+            input:
+              type: string
+            values:
+              type: array
+              items:
+                type: string
+        exists:
+          type: object
+          required: [input]
+          properties:
+            input:
+              type: string
+    ProcessPatch:
+      type: object
+      required: [stepId, id, name, command]
+      properties:
+        stepId:
+          type: string
+        id:
+          type: string
+        name:
+          type: string
+        command:
+          type: string
+        arguments:
+          type: array
+          items:
+            type: string
+        workingDirectory:
+          type: string
+        when:
+          oneOf:
+            - $ref: "#/components/schemas/Predicate"
+            - type: "null"
     Visualization:
       type: object
       properties:
         position:
           $ref: "#/components/schemas/VizPosition"
+        size:
+          $ref: "#/components/schemas/VizSize"
     VizPosition:
       type: object
       required: [x, y]
@@ -372,6 +473,34 @@ components:
           type: number
         y:
           type: number
+    VizSize:
+      type: object
+      required: [width, height]
+      properties:
+        width:
+          type: number
+        height:
+          type: number
+    PatchWorkflowVisualization:
+      type: object
+      description: Send steps, processes, or both.
+      properties:
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/StepVizPatch"
+        processes:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProcessPatch"
+    StepVizPatch:
+      type: object
+      required: [id, visualization]
+      properties:
+        id:
+          type: string
+        visualization:
+          $ref: "#/components/schemas/Visualization"
     InputView:
       type: object
       required: [name]

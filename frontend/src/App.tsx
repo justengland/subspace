@@ -2,8 +2,11 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   API_BASE,
   api,
+  type Predicate,
+  type ProcessView,
   type Repo,
   type TimelineEvent,
+  type Visualization,
   type Workflow,
   type WorkflowRun,
 } from "./api/client";
@@ -338,12 +341,157 @@ function WorkflowList({ repo }: { repo: string }) {
   );
 }
 
+function whenKind(when: Predicate | null | undefined): "none" | "eq" | "in" | "exists" {
+  if (when?.eq) return "eq";
+  if (when?.in) return "in";
+  if (when?.exists) return "exists";
+  return "none";
+}
+
+function whenInput(when: Predicate | null | undefined): string {
+  return when?.eq?.input ?? when?.in?.input ?? when?.exists?.input ?? "";
+}
+
+function lookupProcess(workflow: Workflow, sel: { stepId: string; processId: string }) {
+  return workflow.steps.find((s) => s.id === sel.stepId)?.processes?.find((p) => p.id === sel.processId);
+}
+
+function ProcessEditor({
+  repo,
+  workflowId,
+  stepId,
+  process,
+  onSaved,
+}: {
+  repo: string;
+  workflowId: string;
+  stepId: string;
+  process: ProcessView;
+  onSaved: (workflow: Workflow) => void;
+}) {
+  const [name, setName] = useState(process.name);
+  const [command, setCommand] = useState(process.command);
+  const [args, setArgs] = useState((process.arguments ?? []).join("\n"));
+  const [cwd, setCwd] = useState(process.workingDirectory ?? "");
+  const [kind, setKind] = useState(whenKind(process.when));
+  const [input, setInput] = useState(whenInput(process.when));
+  const [value, setValue] = useState(process.when?.eq?.value ?? "");
+  const [values, setValues] = useState((process.when?.in?.values ?? []).join("\n"));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  async function save() {
+    setSaving(true);
+    setError("");
+    let when: Predicate | null = null;
+    if (kind === "eq") when = { eq: { input, value } };
+    else if (kind === "in") {
+      when = {
+        in: { input, values: values.split("\n").map((v) => v.trim()).filter(Boolean) },
+      };
+    } else if (kind === "exists") when = { exists: { input } };
+    const { data, error: err } = await api.PATCH("/api/workflows/{repo}/{workflowId}", {
+      params: { path: { repo, workflowId } },
+      body: {
+        processes: [
+          {
+            stepId,
+            id: process.id,
+            name,
+            command,
+            arguments: args.split("\n").filter((line) => line !== ""),
+            workingDirectory: cwd,
+            when,
+          },
+        ],
+      },
+    });
+    setSaving(false);
+    if (err || !data) {
+      setError(typeof err === "string" ? err : "failed to save process");
+      return;
+    }
+    onSaved(data);
+  }
+
+  return (
+    <section className="panel-section">
+      <h2>Process</h2>
+      <p className="muted">
+        {stepId} · {process.id}
+      </p>
+      <label className="field">
+        Name
+        <input autoFocus value={name} onChange={(e) => setName(e.target.value)} />
+      </label>
+      <label className="field">
+        Command
+        <input value={command} onChange={(e) => setCommand(e.target.value)} />
+      </label>
+      <label className="field">
+        Arguments
+        <textarea
+          value={args}
+          onChange={(e) => setArgs(e.target.value)}
+          rows={3}
+          placeholder="one argument per line"
+        />
+      </label>
+      <label className="field">
+        Working directory
+        <input value={cwd} onChange={(e) => setCwd(e.target.value)} />
+      </label>
+      <label className="field">
+        When
+        <select value={kind} onChange={(e) => setKind(e.target.value as typeof kind)}>
+          <option value="none">none</option>
+          <option value="eq">eq</option>
+          <option value="in">in</option>
+          <option value="exists">exists</option>
+        </select>
+      </label>
+      {kind !== "none" && (
+        <label className="field">
+          Input
+          <input value={input} onChange={(e) => setInput(e.target.value)} />
+        </label>
+      )}
+      {kind === "eq" && (
+        <label className="field">
+          Value
+          <input value={value} onChange={(e) => setValue(e.target.value)} />
+        </label>
+      )}
+      {kind === "in" && (
+        <label className="field">
+          Values
+          <textarea
+            value={values}
+            onChange={(e) => setValues(e.target.value)}
+            rows={3}
+            placeholder="one value per line"
+          />
+        </label>
+      )}
+      {error && <p className="debugger-error">{error}</p>}
+      <button type="button" className="panel-btn" disabled={saving} onClick={() => void save()}>
+        {saving ? "Saving…" : "Save process"}
+      </button>
+    </section>
+  );
+}
+
 function WorkflowCanvas({ repo, workflowId }: { repo: string; workflowId: string }) {
   const [workflow, setWorkflow] = useState<Workflow | null>(null);
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [layoutGen, setLayoutGen] = useState(0);
   const [inputOverrideText, setInputOverrideText] = useState("");
   const [argOverrideText, setArgOverrideText] = useState("");
+  const [selectedProcess, setSelectedProcess] = useState<{ stepId: string; processId: string } | null>(
+    null,
+  );
   useEffect(() => {
     void (async () => {
       const { data, error: err, response } = await api.GET("/api/workflows/{repo}/{workflowId}", {
@@ -360,6 +508,51 @@ function WorkflowCanvas({ repo, workflowId }: { repo: string; workflowId: string
       setWorkflow(data);
     })();
   }, [repo, workflowId]);
+
+  async function saveStepVisualization(stepId: string, visualization: Visualization) {
+    setSaving(true);
+    setError("");
+    // optimistic local update
+    setWorkflow((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        steps: prev.steps.map((s) => (s.id === stepId ? { ...s, visualization } : s)),
+      };
+    });
+    const { data, error: err } = await api.PATCH("/api/workflows/{repo}/{workflowId}", {
+      params: { path: { repo, workflowId } },
+      body: { steps: [{ id: stepId, visualization }] },
+    });
+    setSaving(false);
+    if (err || !data) {
+      setError(typeof err === "string" ? err : "failed to save visualization");
+      return;
+    }
+    setWorkflow(data);
+  }
+
+  async function autoFormat() {
+    if (!workflow?.steps.length) return;
+    setSaving(true);
+    setError("");
+    setWorkflow((prev) =>
+      prev
+        ? { ...prev, steps: prev.steps.map((s) => ({ ...s, visualization: undefined })) }
+        : prev,
+    );
+    setLayoutGen((n) => n + 1);
+    const { data, error: err } = await api.PATCH("/api/workflows/{repo}/{workflowId}", {
+      params: { path: { repo, workflowId } },
+      body: { steps: workflow.steps.map((s) => ({ id: s.id, visualization: {} })) },
+    });
+    setSaving(false);
+    if (err || !data) {
+      setError(typeof err === "string" ? err : "failed to save visualization");
+      return;
+    }
+    setWorkflow(data);
+  }
 
   async function startRun() {
     setStarting(true);
@@ -389,6 +582,8 @@ function WorkflowCanvas({ repo, workflowId }: { repo: string; workflowId: string
     navigate(`/runs/${encodeURIComponent(repo)}/${encodeURIComponent(data.id)}`);
   }
 
+  const editing = workflow && selectedProcess ? lookupProcess(workflow, selectedProcess) : undefined;
+
   return (
     <Shell title={workflow?.name ?? workflowId}>
       <p>
@@ -398,23 +593,42 @@ function WorkflowCanvas({ repo, workflowId }: { repo: string; workflowId: string
       {workflow && (
         <div className="debugger-split" style={{ minHeight: "60vh" }}>
           <div className="debugger-canvas">
-            <p style={{ marginBottom: "0.75rem" }}>
+            <p style={{ marginBottom: "0.75rem", display: "flex", gap: "0.5rem" }}>
               <button type="button" onClick={() => void startRun()} disabled={starting}>
                 {starting ? "Starting…" : "Start WorkflowRun"}
+              </button>
+              <button type="button" onClick={() => void autoFormat()} disabled={saving}>
+                Auto format
               </button>
             </p>
             <div className="wf-canvas">
               <Canvas
+                key={layoutGen}
                 steps={workflow.steps}
                 connections={workflow.connections}
                 stepStatus={{}}
+                selectedProcess={selectedProcess ?? undefined}
+                onSelectProcess={(stepId, processId) => setSelectedProcess({ stepId, processId })}
+                onStepVisualizationChange={(id, viz) => void saveStepVisualization(id, viz)}
               />
             </div>
             <p className="muted" style={{ marginTop: "0.75rem" }}>
-              Read-only canvas. Edit Workflow YAML on disk. Working tree is the Repo path.
+              Drag Steps to move, corner to resize. Click a Process to edit it. Auto format restores the vertical column.
+              Layout commits to Workflow YAML
+              {saving ? " (saving…)" : ""}.
             </p>
           </div>
           <aside className="debugger-panel">
+            {editing && selectedProcess && (
+              <ProcessEditor
+                key={`${selectedProcess.stepId}/${selectedProcess.processId}`}
+                repo={repo}
+                workflowId={workflowId}
+                stepId={selectedProcess.stepId}
+                process={editing}
+                onSaved={setWorkflow}
+              />
+            )}
             <section className="panel-section">
               <h2>Overrides</h2>
               <label className="field">
@@ -449,6 +663,9 @@ function RunDebugger({ repo, runId }: { repo: string; runId: string }) {
   const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [timelineKey, setTimelineKey] = useState(0);
   const [rewindStepId, setRewindStepId] = useState("");
+  const [selectedProcess, setSelectedProcess] = useState<{ stepId: string; processId: string } | null>(
+    null,
+  );
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const stepStatus = useMemo(() => deriveStepStatus(run, events), [run, events]);
@@ -560,6 +777,7 @@ function RunDebugger({ repo, runId }: { repo: string; runId: string }) {
   }
 
   const tone = statusTone(run?.status);
+  const editing = workflow && selectedProcess ? lookupProcess(workflow, selectedProcess) : undefined;
 
   return (
     <div className="debugger">
@@ -626,7 +844,9 @@ function RunDebugger({ repo, runId }: { repo: string; runId: string }) {
                   connections={workflow.connections}
                   stepStatus={stepStatus}
                   cursorStepId={run?.cursorStepId}
+                  selectedProcess={selectedProcess ?? undefined}
                   onSelectStep={setRewindStepId}
+                  onSelectProcess={(stepId, processId) => setSelectedProcess({ stepId, processId })}
                 />
               </div>
             ) : (
@@ -634,6 +854,16 @@ function RunDebugger({ repo, runId }: { repo: string; runId: string }) {
             )}
           </div>
           <aside className="debugger-panel">
+            {editing && selectedProcess && (
+              <ProcessEditor
+                key={`${selectedProcess.stepId}/${selectedProcess.processId}`}
+                repo={repo}
+                workflowId={workflow!.id}
+                stepId={selectedProcess.stepId}
+                process={editing}
+                onSaved={setWorkflow}
+              />
+            )}
             <section className="panel-section">
               <h2>Rewind</h2>
               <label className="field">

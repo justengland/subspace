@@ -1,11 +1,14 @@
 package api_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/justengland/subspace/backend/api"
@@ -128,6 +131,75 @@ steps:
 	h.ServeHTTP(rr6, httptest.NewRequest(http.MethodGet, "/api/workflows/pipe", nil))
 	if rr6.Code != http.StatusNotFound {
 		t.Fatalf("flat id status %d want 404: %s", rr6.Code, rr6.Body)
+	}
+}
+
+func TestHTTPPatchWorkflowVisualizationCommits(t *testing.T) {
+	home := t.TempDir()
+	proj := filepath.Join(home, "proj")
+	mustMkdir(t, proj)
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = proj
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", args, out)
+		}
+	}
+	run("git", "init")
+	run("git", "config", "user.email", "test@example.com")
+	run("git", "config", "user.name", "Test")
+	if err := registry.Add(home, "demo", proj); err != nil {
+		t.Fatal(err)
+	}
+	writeWorkflow(t, home, "demo", "viz", `
+id: viz
+name: Viz
+steps:
+  - id: a
+    name: A
+    mode: series
+    processes:
+      - id: p
+        name: Proc
+        command: true
+`)
+	eng := engine.New(engine.Config{StorageRoot: home})
+	h := (&api.Server{Eng: eng, Home: home}).Handler()
+
+	body := `{"steps":[{"id":"a","visualization":{"position":{"x":11,"y":22},"size":{"width":200,"height":100}}}]}`
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/api/workflows/demo/viz", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rr.Code, rr.Body)
+	}
+	var wf engine.Workflow
+	if err := json.Unmarshal(rr.Body.Bytes(), &wf); err != nil {
+		t.Fatal(err)
+	}
+	if wf.Steps[0].Visualization == nil || wf.Steps[0].Visualization.Position.X != 11 {
+		t.Fatalf("viz=%+v", wf.Steps[0].Visualization)
+	}
+	if len(wf.Steps[0].Processes) != 1 || wf.Steps[0].Processes[0].Name != "Proc" {
+		t.Fatalf("processes=%+v", wf.Steps[0].Processes)
+	}
+	mirrored := filepath.Join(proj, "workflows", "viz.yaml")
+	b, err := os.ReadFile(mirrored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "width: 200") {
+		t.Fatalf("mirrored yaml missing size: %s", b)
+	}
+	log := exec.Command("git", "-C", proj, "log", "-1", "--oneline")
+	out, err := log.CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "visualization") {
+		t.Fatalf("commit log=%s", out)
 	}
 }
 
