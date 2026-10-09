@@ -18,6 +18,13 @@ steps:
           arguments: []
           workingDirectory: ""
           when: null
+      visualization:
+        position:
+            x: 24
+            "y": 35.51493453979492
+        size:
+            width: 168
+            height: 46
     - id: decide
       name: Decision
       mode: decision
